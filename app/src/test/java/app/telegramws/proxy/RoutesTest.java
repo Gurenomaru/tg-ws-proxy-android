@@ -1,0 +1,35 @@
+package app.telegramws.proxy;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
+import java.util.Collections;
+import java.util.List;
+import org.junit.Test;
+
+public final class RoutesTest {
+    @Test
+    public void upgradesOnlyTheOldPreset() {
+        assertEquals(Routes.DEFAULT_IPS, Routes.upgradedIps(Routes.LEGACY_DEFAULT_IPS));
+        assertEquals(Routes.DEFAULT_IPS, Routes.upgradedIps(Routes.LEGACY_DEFAULT_IPS.replace("\n", "\r\n")));
+        assertEquals("", Routes.upgradedIps(""));
+        assertEquals("4:149.154.167.220", Routes.upgradedIps("4:149.154.167.220"));
+        assertEquals("203:91.105.192.100", Routes.upgradedIps("203:91.105.192.100"));
+    }
+
+    @Test
+    public void triesMediaHostFirstButPreservesCdnNumberInTheRelay() {
+        Routes.Config config = new Routes.Config(1443, "", Collections.singletonMap(203, "149.154.167.220"),
+            "", "", false, true, null, false);
+        Routes.Dc cdn = Routes.Dc.fromWire((short) -203);
+        List<Routes.Stage> stages = Routes.candidates(cdn, config);
+        List<Routes.Target> direct = stages.get(0).targets();
+        assertEquals("kws2-1.web.telegram.org", direct.get(0).host());
+        assertEquals("149.154.167.220", direct.get(0).address());
+        assertEquals("/apiws", direct.get(0).path());
+        assertTrue(direct.stream().anyMatch(route -> route.host().equals("kws2.web.telegram.org")));
+        assertEquals(-203, cdn.relayId());
+        assertEquals("91.105.192.100", stages.get(1).targets().get(0).address());
+        assertTrue(Routes.DEFAULT_IPS.contains("203:149.154.167.220"));
+    }
+}

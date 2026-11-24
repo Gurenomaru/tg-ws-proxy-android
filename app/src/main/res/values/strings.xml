@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">Telegram WS</string>
+    <string name="notification_channel">Работа прокси</string>
+    <string name="notification_starting">Прокси запускается</string>
+    <string name="notification_running">Локальный прокси запущен</string>
+    <string name="loopback_address" translatable="false">127.0.0.1:%1$s</string>
+    <string name="stop">Остановить</string>
+</resources>
