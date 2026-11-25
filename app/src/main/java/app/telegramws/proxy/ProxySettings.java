@@ -36,7 +36,7 @@ final class ProxySettings {
         return new Routes.Config(port(), secret, parseIps(ips()),
             values.getString("cloudflare", ""), values.getString("worker", ""),
             values.getBoolean("community", false), values.getBoolean("tcp", true),
-            loadSocks(), values.getBoolean("socksFirst", false));
+            loadSocks(), values.getBoolean("socksFirst", false), values.getBoolean("communityPlain", false));
     }
 
     int port() {
@@ -61,7 +61,8 @@ final class ProxySettings {
     }
 
     void save(String port, String ips, String cloudflare, String worker, boolean community, boolean tcp,
-              String socksAddress, String socksUser, String socksPassword, boolean socksFirst) {
+              String socksAddress, String socksUser, String socksPassword, boolean socksFirst,
+              boolean communityPlain) {
         int parsedPort;
         try {
             parsedPort = Integer.parseInt(port.trim());
@@ -89,6 +90,7 @@ final class ProxySettings {
             .putInt("port", parsedPort).putString("overrides", ips.trim())
             .putString("cloudflare", cfHost).putString("worker", workerHost)
             .putBoolean("community", community).putBoolean("tcp", tcp)
+            .putBoolean("communityPlain", communityPlain)
             .putBoolean("socksFirst", socks != null && socksFirst).apply();
     }
 

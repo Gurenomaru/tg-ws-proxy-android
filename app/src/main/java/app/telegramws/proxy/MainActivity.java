@@ -28,6 +28,7 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 
@@ -50,6 +51,8 @@ public final class MainActivity extends Activity {
     private ProxySettings settings;
     private TextView status, address, description, probeStatus;
     private Button toggle, connect, copy, probe, edit;
+    private Button diagnostics, shareReport;
+    private int announcedDiagnostics;
     private long busyUntil;
 
     @Override
@@ -114,6 +117,11 @@ public final class MainActivity extends Activity {
         add(page, probe, 6);
         probeStatus = text("", 14, MINT);
         add(page, probeStatus, 6);
+        diagnostics = button("Расширенная диагностика", false, v -> offerDiagnostics());
+        add(page, diagnostics, 7);
+        shareReport = button("Поделиться последним отчётом", false,
+            v -> shareDiagnostics(NetworkDiagnostics.status().report()));
+        add(page, shareReport, 7);
         add(page, button("Журнал соединений", false, v -> openJournal()), 7);
         edit = button("Настройки маршрутов", false, v -> openSettings());
         add(page, edit, 0);
@@ -158,6 +166,54 @@ public final class MainActivity extends Activity {
         edit.setEnabled(!online && !starting);
         probeStatus.setVisibility(view.probe().isEmpty() ? View.GONE : View.VISIBLE);
         probeStatus.setText(view.probe());
+        renderDiagnostics();
+    }
+
+    private void renderDiagnostics() {
+        NetworkDiagnostics.State state = NetworkDiagnostics.status();
+        diagnostics.setEnabled(!state.running());
+        diagnostics.setText(state.running() ? "Проверяем сеть…" : "Расширенная диагностика");
+        shareReport.setVisibility(state.report() == null ? View.GONE : View.VISIBLE);
+        if (state.id() == 0 || state.running() || state.id() == announcedDiagnostics || !hasWindowFocus()) {
+            return;
+        }
+        announcedDiagnostics = state.id();
+        if (state.report() == null) {
+            toast("Не удалось сохранить диагностический отчёт");
+            return;
+        }
+        new AlertDialog.Builder(this).setTitle("Диагностика завершена")
+            .setMessage("Можно отправить текстовый отчёт. В нём только результаты проверок и общие параметры подключения.")
+            .setPositiveButton("Поделиться .txt", (dialog, which) -> shareDiagnostics(state.report()))
+            .setNegativeButton("Закрыть", null).show();
+    }
+
+    private void offerDiagnostics() {
+        new AlertDialog.Builder(this).setTitle("Расширенная диагностика")
+            .setMessage("Тест проверяет IPv4 и IPv6, адреса Telegram, контрольный HTTPS и настроенные маршруты. "
+                + "Полная проверка также обращается к публичным доменам Flowseal, которые видят IP соединения. "
+                + "Отчёт можно отправить вручную после завершения.")
+            .setPositiveButton("Полная проверка", (dialog, which) -> startDiagnostics(true))
+            .setNeutralButton("Без доменов Flowseal", (dialog, which) -> startDiagnostics(false))
+            .setNegativeButton("Отмена", null).show();
+    }
+
+    private void startDiagnostics(boolean includeCommunity) {
+        NetworkDiagnostics.start(this, includeCommunity);
+        renderDiagnostics();
+    }
+
+    private void shareDiagnostics(File report) {
+        if (report == null || !report.isFile()) {
+            toast("Отчёт недоступен. Запустите диагностику ещё раз.");
+            return;
+        }
+        Uri uri = DiagnosticReport.uri(this, report);
+        Intent send = new Intent(Intent.ACTION_SEND).setType("text/plain")
+            .putExtra(Intent.EXTRA_STREAM, uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
+        send.setClipData(ClipData.newUri(getContentResolver(), "Отчёт диагностики", uri));
+        startActivity(Intent.createChooser(send, "Отправить отчёт"));
     }
 
     private void toggle() {
@@ -264,7 +320,10 @@ public final class MainActivity extends Activity {
         add(form, text("Одна пара DC:IPv4 на строку. Пустое поле включает обычный DNS.", 13, MUTED), 10);
         EditText cf = field(form, "Домен Cloudflare", current.cloudflare(), InputType.TYPE_TEXT_VARIATION_URI);
         EditText worker = field(form, "Домен Cloudflare Worker", current.worker(), InputType.TYPE_TEXT_VARIATION_URI);
-        CheckBox community = check(form, "Резервные домены из списка Flowseal", current.community());
+        CheckBox community = check(form, "Резервные домены Flowseal (WSS)", current.community());
+        CheckBox communityPlain = check(form, "Мобильный режим Flowseal (WS, порт 80)", current.communityPlain());
+        add(form, text("Сначала пробует публичные домены Flowseal. Этот маршрут работает без TLS, "
+            + "шифрование MTProto сохраняется.", 13, MUTED), 10);
         CheckBox tcp = check(form, "Резервное прямое TCP-подключение к Telegram", current.tcp());
         Socks5.Endpoint socks = current.socks();
         EditText socksAddress = field(form, "Адрес SOCKS5", socks == null ? "" : socks.address(),
@@ -287,7 +346,7 @@ public final class MainActivity extends Activity {
                 settings.save(port.getText().toString(), ips.getText().toString(), cf.getText().toString(),
                     worker.getText().toString(), community.isChecked(), tcp.isChecked(),
                     socksAddress.getText().toString(), socksUser.getText().toString(),
-                    socksPassword.getText().toString(), socksFirst.isChecked());
+                    socksPassword.getText().toString(), socksFirst.isChecked(), communityPlain.isChecked());
                 dialog.dismiss();
                 render();
             } catch (IllegalArgumentException e) {

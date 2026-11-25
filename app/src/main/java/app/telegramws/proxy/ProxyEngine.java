@@ -7,6 +7,7 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetAddress;
+import java.net.Inet6Address;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.ServerSocket;
@@ -342,11 +343,24 @@ final class ProxyEngine implements Closeable {
             socket.connect(new InetSocketAddress(endpoint.host(), endpoint.port()), CONNECT_TIMEOUT);
             Socks5.connect(socket, endpoint, InetAddress.getByName(target.address()), 443);
         } else {
-            socket.connect(new InetSocketAddress(target.address(), 443), CONNECT_TIMEOUT);
+            socket.connect(destination(target), CONNECT_TIMEOUT);
         }
         WebSocketWire ws = target.webSocket() ? WebSocketWire.connect(socket, target) : null;
         socket.setSoTimeout(0);
         return new Connected(target, socket, ws);
+    }
+
+    private static InetSocketAddress destination(Routes.Target target) throws UnknownHostException {
+        if (target.family() == Routes.Family.SYSTEM) {
+            return new InetSocketAddress(target.address(), target.port());
+        }
+        boolean ipv6 = target.family() == Routes.Family.IPV6;
+        for (InetAddress address : InetAddress.getAllByName(target.address())) {
+            if ((address instanceof Inet6Address) == ipv6) {
+                return new InetSocketAddress(address, target.port());
+            }
+        }
+        throw new UnknownHostException("Нет адреса нужного семейства");
     }
 
     void networkChanged() {

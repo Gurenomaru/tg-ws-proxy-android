@@ -15,7 +15,7 @@ final class Routes {
         return LEGACY_DEFAULT_IPS.equals(stored.trim().replace("\r\n", "\n")) ? DEFAULT_IPS : stored;
     }
     // Published in Flowseal's fallback list. These are opt-in third-party relays.
-    private static final List<String> COMMUNITY = Arrays.asList(
+    static final List<String> COMMUNITY = Arrays.asList(
         "pclead.co.uk", "offshor.co.uk", "cakeisalie.co.uk", "noskomnadzor.co.uk",
         "lovetrue.co.uk", "sorokdva.co.uk", "pyatdesyatdva.co.uk", "kartoshka.co.uk",
         "sorokodin.co.uk", "pyatdesyatodin.co.uk", "notelega.co.uk", "ebally.co.uk",
@@ -38,9 +38,19 @@ final class Routes {
         }
     }
 
-    record Target(String host, String address, String path, String sni, String label, boolean socks) {
+    enum Family { SYSTEM, IPV4, IPV6 }
+
+    record Target(String host, String address, String path, String sni, String label, boolean socks,
+                  int port, Family family) {
+        Target(String host, String address, String path, String sni, String label, boolean socks, int port) {
+            this(host, address, path, sni, label, socks, port, Family.SYSTEM);
+        }
         Target(String host, String address, String path, String sni, String label) {
-            this(host, address, path, sni, label, false);
+            this(host, address, path, sni, label, false, 443);
+        }
+
+        Target(String host, String address, String path, String sni, String label, boolean socks) {
+            this(host, address, path, sni, label, socks, 443);
         }
 
         String description() {
@@ -56,7 +66,8 @@ final class Routes {
     }
 
     record Config(int port, String secret, Map<Integer, String> overrides, String cloudflare,
-                  String worker, boolean community, boolean tcp, Socks5.Endpoint socks, boolean socksFirst) {}
+                  String worker, boolean community, boolean tcp, Socks5.Endpoint socks, boolean socksFirst,
+                  boolean communityPlain) {}
 
     record Stage(List<Target> targets, int attemptLimit) {
         Stage(List<Target> targets) {
@@ -90,13 +101,17 @@ final class Routes {
             telegram.add(new Target(host, override, path, null, "WSS Telegram"));
         }
         if (dc.media) {
-            telegram.add(new Target(mediaHost, mediaHost, path, null, "WSS Telegram"));
+            addDnsRoutes(telegram, mediaHost, path);
         }
-        telegram.add(new Target(host, host, path, null, "WSS Telegram"));
+        addDnsRoutes(telegram, host, path);
         stages.add(new Stage(telegram));
         if (config.socks != null) {
             Target viaSocks = new Target(tcp, tcp, null, null, "TCP через SOCKS5", true);
             stages.add(config.socksFirst ? 0 : 1, new Stage(viaSocks));
+        }
+        if (config.communityPlain && !dc.test) {
+            int relayPosition = config.socks != null && config.socksFirst ? 1 : 0;
+            stages.add(relayPosition, community(dc, 80));
         }
         if (!config.worker.isEmpty()) {
             stages.add(new Stage(new Target(config.worker, config.worker,
@@ -104,23 +119,41 @@ final class Routes {
         }
         if (!dc.test) {
             if (!config.cloudflare.isEmpty()) {
-                stages.add(new Stage(cloudflare(dc, config.cloudflare)));
+                stages.add(new Stage(cloudflare(dc, config.cloudflare, 443)));
             }
             if (config.community) {
-                List<Target> relays = new ArrayList<>();
-                for (String domain : COMMUNITY) {
-                    relays.add(cloudflare(dc, domain));
-                }
-                stages.add(new Stage(relays, COMMUNITY_ATTEMPTS));
+                stages.add(community(dc, 443));
             }
         }
         if (config.tcp) {
-            stages.add(new Stage(new Target(tcp, tcp, null, null, "TCP Telegram")));
+            Target ipv4 = new Target(tcp, tcp, null, null, "TCP Telegram");
+            String ipv6 = ipv6Address(dc);
+            stages.add(ipv6 == null ? new Stage(ipv4) : new Stage(Arrays.asList(ipv4,
+                new Target(ipv6, ipv6, null, null, "TCP Telegram IPv6"))));
         }
         return stages;
     }
 
-    private static String tcpAddress(Dc dc) {
+    private static void addDnsRoutes(List<Target> targets, String host, String path) {
+        targets.add(new Target(host, host, path, null, "WSS Telegram IPv6", false, 443, Family.IPV6));
+        targets.add(new Target(host, host, path, null, "WSS Telegram IPv4", false, 443, Family.IPV4));
+    }
+
+    static String ipv6Address(Dc dc) {
+        if (dc.test) {
+            return null;
+        }
+        return switch (dc.number) {
+            case 1 -> "2001:b28:f23d:f001::a";
+            case 2 -> "2001:67c:4e8:f002::a";
+            case 3 -> "2001:b28:f23d:f003::a";
+            case 4 -> "2001:67c:4e8:f004::a";
+            case 5 -> "2001:b28:f23f:f005::a";
+            default -> null;
+        };
+    }
+
+    static String tcpAddress(Dc dc) {
         if (dc.test) {
             return switch (dc.number) {
                 case 1 -> "149.154.175.10";
@@ -140,8 +173,17 @@ final class Routes {
         };
     }
 
-    private static Target cloudflare(Dc dc, String domain) {
+    private static Stage community(Dc dc, int port) {
+        List<Target> relays = new ArrayList<>();
+        for (String domain : COMMUNITY) {
+            relays.add(cloudflare(dc, domain, port));
+        }
+        return new Stage(relays, COMMUNITY_ATTEMPTS);
+    }
+
+    private static Target cloudflare(Dc dc, String domain, int port) {
         String host = "kws" + dc.number + "." + domain;
-        return new Target(host, host, "/apiws", null, "Cloudflare WSS");
+        String label = port == 80 ? "Cloudflare WS · порт 80" : "Cloudflare WSS";
+        return new Target(host, host, "/apiws", null, label, false, port);
     }
 }

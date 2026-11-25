@@ -81,7 +81,7 @@ public final class ProxyEngineTest {
     private static ProxyEngine start(ServerSocket relay, List<String> journal) throws IOException {
         relay.setSoTimeout(3000);
         Socks5.Endpoint socks = Socks5.parse("127.0.0.1:" + relay.getLocalPort(), "", "");
-        Routes.Config config = new Routes.Config(0, "", Collections.emptyMap(), "", "", false, false, socks, true);
+        Routes.Config config = new Routes.Config(0, "", Collections.emptyMap(), "", "", false, false, socks, true, false);
         ProxyEngine engine = new ProxyEngine(config, SECRET, journal::add);
         new Thread(() -> {
             try {

@@ -37,12 +37,28 @@ final class WebSocketWire {
     private long remaining;
 
     static WebSocketWire connect(Socket raw, Routes.Target target) throws IOException {
+        if (target.port() == 80) {
+            return new WebSocketWire(raw, target);
+        }
+        SSLSocket tls = openTls(raw, target);
+        try {
+            WebSocketWire result = new WebSocketWire(tls, target);
+            tls.setSoTimeout(0);
+            return result;
+        } catch (IOException | RuntimeException e) {
+            tls.close();
+            throw e;
+        }
+    }
+
+    static SSLSocket openTls(Socket raw, Routes.Target target) throws IOException {
         // Override only the routing name. The certificate must still identify Telegram Web.
         String peer = target.sni() == null ? target.host() : "web.telegram.org";
         String sni = target.sni() == null ? target.host() : target.sni();
         SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
-        SSLSocket tls = (SSLSocket) factory.createSocket(raw, peer, 443, true);
+        SSLSocket tls = (SSLSocket) factory.createSocket(raw, peer, target.port(), true);
         try {
+            tls.setSoTimeout(raw.getSoTimeout());
             SSLParameters parameters = tls.getSSLParameters();
             parameters.setServerNames(Collections.singletonList(new SNIHostName(sni)));
             parameters.setEndpointIdentificationAlgorithm("HTTPS");
@@ -53,9 +69,7 @@ final class WebSocketWire {
                 throw new SSLPeerUnverifiedException("Сертификат не подтверждает Telegram Web");
             }
 
-            WebSocketWire result = new WebSocketWire(tls, target);
-            tls.setSoTimeout(0);
-            return result;
+            return tls;
         } catch (IOException | RuntimeException e) {
             tls.close();
             throw e;

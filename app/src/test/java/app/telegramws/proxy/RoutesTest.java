@@ -20,7 +20,7 @@ public final class RoutesTest {
     @Test
     public void triesMediaHostFirstButPreservesCdnNumberInTheRelay() {
         Routes.Config config = new Routes.Config(1443, "", Collections.singletonMap(203, "149.154.167.220"),
-            "", "", false, true, null, false);
+            "", "", false, true, null, false, false);
         Routes.Dc cdn = Routes.Dc.fromWire((short) -203);
         List<Routes.Stage> stages = Routes.candidates(cdn, config);
         List<Routes.Target> direct = stages.get(0).targets();
@@ -31,5 +31,22 @@ public final class RoutesTest {
         assertEquals(-203, cdn.relayId());
         assertEquals("91.105.192.100", stages.get(1).targets().get(0).address());
         assertTrue(Routes.DEFAULT_IPS.contains("203:149.154.167.220"));
+    }
+
+    @Test
+    public void explicitMobileModePrefersPlainCommunityWebSocket() {
+        Routes.Config mobile = new Routes.Config(1443, "", Collections.emptyMap(),
+            "", "", false, true, null, false, true);
+        var dc = Routes.Dc.fromWire((short) -4);
+        var routes = Routes.candidates(dc, mobile);
+        var target = routes.get(0).targets().get(0);
+        assertEquals("kws4.pclead.co.uk", target.host());
+        assertEquals(80, target.port());
+        assertEquals("/apiws", target.path());
+        assertEquals(443, routes.get(1).targets().get(0).port());
+        var fallback = new Routes.Config(1443, "", Collections.emptyMap(),
+            "", "", true, false, null, false, false);
+        var secure = Routes.candidates(dc, fallback);
+        assertEquals(443, secure.get(1).targets().get(0).port());
     }
 }
