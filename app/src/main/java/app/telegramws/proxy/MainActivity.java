@@ -276,9 +276,9 @@ public final class MainActivity extends Activity {
             startProxy();
         } else {
             new AlertDialog.Builder(this).setTitle("Добавить автоматический резерв?")
-                .setMessage("Если прямое подключение не отвечает, прокси подберёт маршрут через публичные "
-                    + "серверы Flowseal. Эти серверы видят IP и время подключения. При необходимости "
-                    + "используется порт 80 без внешнего TLS. Выбор можно изменить в настройках маршрутов.")
+                .setMessage("На мобильной сети прокси начнёт с публичных серверов Flowseal. В других сетях "
+                    + "они будут резервом. Эти серверы видят IP и время подключения. На порту 80 "
+                    + "используется MTProto без внешнего TLS. Выбор можно изменить в настройках маршрутов.")
                 .setPositiveButton("Разрешить резерв", (dialog, which) -> startWithAutomaticRoutes(true))
                 .setNegativeButton("Оставить мои настройки", (dialog, which) -> startWithAutomaticRoutes(false))
                 .show();
@@ -393,8 +393,8 @@ public final class MainActivity extends Activity {
         EditText cf = field(form, "Домен Cloudflare", current.cloudflare(), InputType.TYPE_TEXT_VARIATION_URI);
         EditText worker = field(form, "Домен Cloudflare Worker", current.worker(), InputType.TYPE_TEXT_VARIATION_URI);
         CheckBox communityAuto = check(form, "Автовыбор с резервом Flowseal", current.communityAuto());
-        add(form, text("Пробует публичные серверы, если обычные маршруты не работают. Их операторы видят IP. "
-            + "На порту 80 сохраняется шифрование MTProto без внешнего TLS.", 13, MUTED), 10);
+        add(form, text("На мобильной сети начинает с Flowseal WS:80. В других сетях Flowseal служит резервом. "
+            + "Операторы серверов видят IP. На порту 80 шифрование MTProto работает без внешнего TLS.", 13, MUTED), 10);
         CheckBox community = check(form, "Резервные домены Flowseal (WSS)", current.community());
         CheckBox communityPlain = check(form, "Мобильный режим Flowseal (WS, порт 80)", current.communityPlain());
         add(form, text("Сначала пробует публичные домены Flowseal. Этот маршрут работает без TLS, "

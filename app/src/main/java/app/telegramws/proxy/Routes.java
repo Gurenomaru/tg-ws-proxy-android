@@ -80,6 +80,10 @@ final class Routes {
     }
 
     static List<Stage> candidates(Dc dc, Config config) {
+        return candidates(dc, config, config.communityPlain && !dc.test);
+    }
+
+    private static List<Stage> candidates(Dc dc, Config config, boolean plainFirst) {
         List<Stage> stages = new ArrayList<>();
         String tcp = tcpAddress(dc);
         if (tcp == null) {
@@ -109,7 +113,7 @@ final class Routes {
             Target viaSocks = new Target(tcp, tcp, null, null, "TCP через SOCKS5", true);
             stages.add(config.socksFirst ? 0 : 1, new Stage(viaSocks));
         }
-        if (config.communityPlain && !dc.test) {
+        if (plainFirst) {
             int relayPosition = config.socks != null && config.socksFirst ? 1 : 0;
             stages.add(relayPosition, community(dc, 80));
         }
@@ -135,20 +139,23 @@ final class Routes {
             if (!config.community) {
                 stages.add(community(dc, 443));
             }
-            if (!config.communityPlain) {
+            if (!plainFirst) {
                 stages.add(community(dc, 80));
             }
         }
         return stages;
     }
 
-    static List<Stage> ordered(Dc dc, Config config, Target preferred) {
-        List<Stage> stages = candidates(dc, config);
+    static List<Stage> ordered(Dc dc, Config config, RouteHealth.Kind kind, Target preferred) {
+        boolean automaticMobile = kind == RouteHealth.Kind.CELLULAR && config.communityAuto
+            && config.cloudflare.isEmpty() && config.worker.isEmpty();
+        boolean plainFirst = !dc.test && (config.communityPlain || automaticMobile);
+        List<Stage> stages = candidates(dc, config, plainFirst);
         if (!config.communityAuto || preferred == null) {
             return stages;
         }
         int first = config.socks != null && config.socksFirst ? 1 : 0;
-        if (config.communityPlain && !dc.test) {
+        if (plainFirst) {
             first++;
         }
         for (int i = first + 1; i < stages.size(); i++) {
@@ -167,34 +174,6 @@ final class Routes {
             break;
         }
         return stages;
-    }
-
-    record Attempt(Target target, long waitMillis) {}
-
-    static boolean useMobileRace(Dc dc, Config config) {
-        return config.communityAuto && !dc.test && tcpAddress(dc) != null && config.socks == null
-            && config.worker.isEmpty() && config.cloudflare.isEmpty()
-            && !config.community && !config.communityPlain;
-    }
-
-    static List<Attempt> mobileAttempts(List<Stage> stages, int rotation) {
-        var attempts = new ArrayList<Attempt>();
-        List<Target> direct = stages.get(0).targets;
-        for (int i = 0; i < direct.size(); i++) {
-            if (i < 2 || i >= direct.size() - 2) {
-                attempts.add(new Attempt(direct.get(i), i == 0 ? 0 : 220));
-            }
-        }
-        addRelayAttempts(attempts, stages.get(stages.size() - 2), rotation, 600);
-        addRelayAttempts(attempts, stages.get(stages.size() - 1), rotation, 1000);
-        return attempts;
-    }
-
-    private static void addRelayAttempts(List<Attempt> attempts, Stage stage, int rotation, long wait) {
-        for (int index = 0; index < 2; index++) {
-            int position = Math.floorMod(rotation + index, stage.targets.size());
-            attempts.add(new Attempt(stage.targets.get(position), wait));
-        }
     }
 
     private static void addDnsRoutes(List<Target> targets, String host, String path) {

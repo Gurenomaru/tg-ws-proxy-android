@@ -54,30 +54,48 @@ public final class RoutesTest {
         Routes.Config auto = new Routes.Config(1443, "", Collections.emptyMap(),
             "", "", false, true, null, false, false, true);
         var dc = Routes.Dc.fromWire((short) 2);
-        var fresh = Routes.ordered(dc, auto, null);
+        var fresh = Routes.ordered(dc, auto, RouteHealth.Kind.WIFI, null);
         assertEquals("WSS Telegram IPv6", fresh.get(0).targets().get(0).label());
         assertEquals(443, fresh.get(2).targets().get(0).port());
         var relay = fresh.get(3).targets().get(0);
         assertEquals(80, relay.port());
-        var remembered = Routes.ordered(dc, auto, relay);
+        var remembered = Routes.ordered(dc, auto, RouteHealth.Kind.WIFI, relay);
         assertEquals(Collections.singletonList(relay), remembered.get(0).targets());
         assertEquals(1, remembered.stream().flatMap(stage -> stage.targets().stream()).filter(relay::equals).count());
     }
     @Test
-    public void mobileRelayStartsWhileDirectConnectionIsStillPending() {
+    public void automaticMobileStartsWithTheSameRoutesAsManualMobileMode() {
         Routes.Config auto = new Routes.Config(1443, "", Collections.emptyMap(),
             "", "", false, true, null, false, false, true);
+        Routes.Config manual = new Routes.Config(1443, "", Collections.emptyMap(),
+            "", "", false, true, null, false, true, false);
+        for (short dcId : new short[]{2, -2, -4, 203}) {
+            var dc = Routes.Dc.fromWire(dcId);
+            var direct = Routes.candidates(dc, auto).get(0).targets().get(0);
+            var manualFirst = Routes.candidates(dc, manual).get(0);
+            var automatic = Routes.ordered(dc, auto, RouteHealth.Kind.CELLULAR, direct);
+            assertEquals(manualFirst, automatic.get(0));
+            assertEquals(80, automatic.get(0).targets().get(0).port());
+            assertTrue(automatic.get(1).targets().contains(direct));
+            assertEquals(1, automatic.stream().filter(stage -> stage.equals(manualFirst)).count());
+        }
+    }
+
+    @Test
+    public void mobilePreferencePreservesOptInAndExplicitProxySettings() {
         var dc = Routes.Dc.fromWire((short) 2);
-        var chosen = Routes.mobileAttempts(Routes.candidates(dc, auto), 0);
-        assertEquals(true, Routes.useMobileRace(dc, auto));
-        assertEquals(false, Routes.useMobileRace(Routes.Dc.fromWire((short) 42), auto));
-        assertEquals(0, chosen.get(0).waitMillis());
-        assertEquals("kws2.pclead.co.uk", chosen.get(2).target().host());
-        assertEquals(443, chosen.get(2).target().port());
-        assertEquals(600, chosen.get(2).waitMillis());
-        int plain = chosen.size() - 2;
-        assertEquals(80, chosen.get(plain).target().port());
-        assertEquals(1000, chosen.get(plain).waitMillis());
-        assertEquals(6, chosen.size());
+        Routes.Config declined = new Routes.Config(1443, "", Collections.emptyMap(),
+            "", "", false, true, null, false, false, false);
+        assertEquals(Routes.candidates(dc, declined),
+            Routes.ordered(dc, declined, RouteHealth.Kind.CELLULAR, null));
+        Routes.Config configured = new Routes.Config(1443, "", Collections.emptyMap(),
+            "", "worker.example.org", false, true, null, false, false, true);
+        assertEquals(Routes.candidates(dc, configured),
+            Routes.ordered(dc, configured, RouteHealth.Kind.CELLULAR, null));
+        Routes.Config socksFirst = new Routes.Config(1443, "", Collections.emptyMap(),
+            "", "", false, true, Socks5.parse("127.0.0.1:1080", "", ""), true, false, true);
+        var ordered = Routes.ordered(dc, socksFirst, RouteHealth.Kind.CELLULAR, null);
+        assertTrue(ordered.get(0).targets().get(0).socks());
+        assertEquals(80, ordered.get(1).targets().get(0).port());
     }
 }
