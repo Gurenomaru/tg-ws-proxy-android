@@ -11,7 +11,7 @@ android {
         minSdk 26
         targetSdk 35
         versionCode 5
-        versionName '0.2.3-nothing-test.1'
+        versionName '0.2.3'
     }
 
     buildFeatures {
