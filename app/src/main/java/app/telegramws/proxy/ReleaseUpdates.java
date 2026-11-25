@@ -15,13 +15,26 @@ import org.json.JSONObject;
 final class ReleaseUpdates {
     private static final String REPOSITORY = "Gurenomaru/tg-ws-proxy-android";
     private static final String API = "https://api.github.com/repos/" + REPOSITORY + "/releases/latest";
-    private static final String RELEASE_TAG = "https://github.com/" + REPOSITORY + "/releases/tag/";
+    private static final String RELEASES = "https://github.com/" + REPOSITORY + "/releases/";
     private static final long MIN_INTERVAL = TimeUnit.HOURS.toMillis(24);
     private static final int RESPONSE_LIMIT = 128 * 1024;
     private static final Pattern VERSION = Pattern.compile("(0|[1-9][0-9]{0,3})\\.(0|[1-9][0-9]{0,3})\\.(0|[1-9][0-9]{0,3})");
+    private static final Pattern SHA256 = Pattern.compile("sha256:[a-f0-9]{64}");
     private static volatile State state = new State(0, false, false, null);
 
-    record Available(String version, String releaseUrl) {}
+    record Available(String version, long apkSize, String digest) {
+        String releaseUrl() {
+            return RELEASES + "tag/v" + version;
+        }
+
+        String downloadUrl() {
+            return RELEASES + "download/v" + version + "/telegram-ws-android-v" + version + ".apk";
+        }
+
+        boolean canDownload() {
+            return apkSize > 0 && apkSize <= UpdateApk.MAX_BYTES && SHA256.matcher(digest).matches();
+        }
+    }
     record State(int id, boolean running, boolean failed, Available available) {}
 
     static State status() {
@@ -91,7 +104,7 @@ final class ReleaseUpdates {
         for (int index = 0; index < assets.length(); index++) {
             JSONObject asset = assets.optJSONObject(index);
             if (asset != null && name.equals(asset.optString("name")) && "uploaded".equals(asset.optString("state"))) {
-                return new Available(version, RELEASE_TAG + tag);
+                return new Available(version, asset.optLong("size"), asset.optString("digest"));
             }
         }
         return null;

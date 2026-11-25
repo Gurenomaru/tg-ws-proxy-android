@@ -17,6 +17,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.Settings;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.View;
@@ -33,6 +34,7 @@ import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 
 public final class MainActivity extends Activity {
+    private static final int ALLOW_INSTALL = 14;
     private static final int BACKGROUND = Color.rgb(16, 25, 35);
     private static final int SURFACE = Color.rgb(24, 38, 50);
     private static final int BORDER = Color.rgb(53, 72, 86);
@@ -188,9 +190,22 @@ public final class MainActivity extends Activity {
     private void renderUpdate() {
         var status = ReleaseUpdates.status();
         var found = status.available();
-        updateCheck.setEnabled(!status.running());
-        updateCheck.setText(status.running() ? "Проверяем обновления…"
+        var download = UpdateApk.status();
+        updateCheck.setEnabled(!status.running() && !download.running());
+        updateCheck.setText(download.running() ? "Скачиваем обновление…"
+            : status.running() ? "Проверяем обновления…"
             : found == null ? "Проверить обновления" : "Доступна версия " + found.version());
+        if (hasWindowFocus()) {
+            var completed = UpdateApk.takeResult();
+            if (completed != null) {
+                if (completed.ready()) {
+                    installUpdate();
+                } else {
+                    toast("Не удалось скачать или проверить обновление");
+                }
+                return;
+            }
+        }
         if (status.id() == 0 || status.running() || status.id() == handledUpdate || !hasWindowFocus()) {
             return;
         }
@@ -208,16 +223,74 @@ public final class MainActivity extends Activity {
     }
 
     private void offerUpdate(ReleaseUpdates.Available release) {
-        new AlertDialog.Builder(this).setTitle("Доступна версия " + release.version())
-            .setMessage("На странице релиза GitHub есть описание изменений и подписанный APK.")
-            .setPositiveButton("Открыть релиз", (dialog, which) -> {
-                try {
-                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(release.releaseUrl())));
-                } catch (ActivityNotFoundException e) {
-                    toast("На устройстве нет браузера");
-                }
-            })
-            .setNegativeButton("Позже", null).show();
+        var dialog = new AlertDialog.Builder(this).setTitle("Доступна версия " + release.version())
+            .setNegativeButton("Позже", null);
+        if (release.canDownload()) {
+            boolean ready = UpdateApk.status().ready() && release.equals(UpdateApk.status().release())
+                && UpdateApk.file(this).isFile();
+            dialog.setMessage(ready ? "APK скачан и проверен. Android предложит установить обновление."
+                    : "Приложение скачает и проверит APK. Android попросит подтвердить установку.")
+                .setPositiveButton(ready ? "Установить" : "Скачать и установить", (window, which) -> {
+                    if (ready) {
+                        installUpdate();
+                    } else {
+                        UpdateApk.download(this, release);
+                        renderUpdate();
+                    }
+                })
+                .setNeutralButton("Открыть GitHub", (window, which) -> openRelease(release));
+        } else {
+            dialog.setMessage("Подписанный APK доступен на странице релиза GitHub.")
+                .setPositiveButton("Открыть релиз", (window, which) -> openRelease(release));
+        }
+        dialog.show();
+    }
+
+    private void openRelease(ReleaseUpdates.Available release) {
+        try {
+            startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(release.releaseUrl())));
+        } catch (ActivityNotFoundException e) {
+            toast("На устройстве нет браузера");
+        }
+    }
+
+    private void installUpdate() {
+        if (!UpdateApk.status().ready() || !UpdateApk.file(this).isFile()) {
+            toast("Скачайте обновление ещё раз");
+            return;
+        }
+        try {
+            if (!getPackageManager().canRequestPackageInstalls()) {
+                new AlertDialog.Builder(this).setTitle("Разрешение на установку")
+                    .setMessage("Откройте настройки Android и разрешите Telegram WS устанавливать обновления. "
+                        + "После возврата Android предложит установить скачанный APK.")
+                    .setPositiveButton("Открыть настройки", (dialog, which) -> openInstallSettings())
+                    .setNegativeButton("Позже", null).show();
+                return;
+            }
+            startActivity(new Intent(Intent.ACTION_VIEW)
+                .setDataAndType(UpdateApkProvider.uri(this), UpdateApkProvider.APK_TYPE)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION));
+        } catch (ActivityNotFoundException | SecurityException e) {
+            toast("Не удалось открыть установщик Android");
+        }
+    }
+
+    private void openInstallSettings() {
+        try {
+            startActivityForResult(new Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                Uri.fromParts("package", getPackageName(), null)), ALLOW_INSTALL);
+        } catch (ActivityNotFoundException | SecurityException e) {
+            toast("Не удалось открыть настройки установки Android");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == ALLOW_INSTALL && getPackageManager().canRequestPackageInstalls()) {
+            installUpdate();
+        }
     }
 
     private void renderDiagnostics() {
