@@ -6,22 +6,36 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.security.SecureRandom;
 import java.util.Arrays;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 final class ProxyProbe {
     private static final int REQ_PQ_MULTI = 0xbe7e8ef1;
     private static final int RES_PQ = 0x05162463;
+    private static final Set<Integer> LOCAL_PROBES = ConcurrentHashMap.newKeySet();
+
+    static boolean isLocalProbe(int port) {
+        return LOCAL_PROBES.contains(port);
+    }
 
     static long check(int port, byte[] secret, short dc) throws IOException {
         long start = System.nanoTime();
         try (Socket socket = new Socket()) {
-            socket.connect(new InetSocketAddress("127.0.0.1", port), 2000);
-            socket.setSoTimeout(17_000);
-            MtProto.Outbound client = MtProto.initiate(MtProto.Mode.PADDED, dc, secret);
-            socket.getOutputStream().write(client.header());
+            socket.bind(new InetSocketAddress("127.0.0.1", 0));
+            int localPort = socket.getLocalPort();
+            LOCAL_PROBES.add(localPort);
+            try {
+                socket.connect(new InetSocketAddress("127.0.0.1", port), 2000);
+                socket.setSoTimeout(17_000);
+                MtProto.Outbound client = MtProto.initiate(MtProto.Mode.PADDED, dc, secret);
+                socket.getOutputStream().write(client.header());
 
-            Request request = request();
-            socket.getOutputStream().write(client.sending().update(request.packet()));
-            request.verify(MtProto.readPacket(socket.getInputStream(), client.receiving(), MtProto.Mode.PADDED));
+                Request request = request();
+                socket.getOutputStream().write(client.sending().update(request.packet()));
+                request.verify(MtProto.readPacket(socket.getInputStream(), client.receiving(), MtProto.Mode.PADDED));
+            } finally {
+                LOCAL_PROBES.remove(localPort);
+            }
         }
         return (System.nanoTime() - start) / 1_000_000;
     }

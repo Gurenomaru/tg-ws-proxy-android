@@ -13,6 +13,7 @@ final class ProxyStatus {
 
     private static final ArrayDeque<String> journal = new ArrayDeque<>();
     private static Phase phase = Phase.OFF;
+    private static ProxyTraffic traffic = new ProxyTraffic();
     private static String detail = "";
     private static int port;
     private static boolean probing;
@@ -21,6 +22,9 @@ final class ProxyStatus {
 
     static synchronized void phase(Phase next, int activePort, String message) {
         phase = next;
+        if (next == Phase.STARTING) {
+            traffic = new ProxyTraffic();
+        }
         port = activePort;
         detail = message;
         if (next == Phase.STARTING || next == Phase.OFF) {
@@ -53,6 +57,15 @@ final class ProxyStatus {
         if (BuildConfig.DEBUG) {
             Log.i("TelegramWs", event);
         }
+    }
+
+    static synchronized ProxyTraffic traffic() {
+        return traffic;
+    }
+
+    static synchronized void appendTraffic(StringBuilder report) {
+        report.append("Фаза сервиса: ").append(phase).append('\n');
+        traffic.appendTo(report);
     }
 
     static synchronized Snapshot snapshot() {

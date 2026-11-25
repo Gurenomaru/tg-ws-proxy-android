@@ -87,12 +87,13 @@ public final class ProxyService extends Service {
         networkKind = defaultNetwork == null ? RouteHealth.Kind.OTHER : kindOf(connectivity.getNetworkCapabilities(defaultNetwork));
         connectivity.registerDefaultNetworkCallback(networkCallback, main);
         watchingNetwork = true;
-        executor.execute(() -> run(config));
+        ProxyTraffic traffic = ProxyStatus.traffic();
+        executor.execute(() -> run(config, traffic));
         return START_NOT_STICKY;
     }
 
-    private void run(Routes.Config config) {
-        try (ProxyEngine created = new ProxyEngine(config, ProxySettings.key(config.secret()), ProxyStatus::log)) {
+    private void run(Routes.Config config, ProxyTraffic traffic) {
+        try (ProxyEngine created = new ProxyEngine(config, ProxySettings.key(config.secret()), ProxyStatus::log, traffic)) {
             synchronized (lock) {
                 if (destroyed) {
                     return;

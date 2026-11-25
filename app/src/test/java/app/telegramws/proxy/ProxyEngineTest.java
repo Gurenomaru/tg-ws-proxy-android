@@ -8,6 +8,7 @@ import static org.junit.Assert.assertTrue;
 
 import java.io.EOFException;
 import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Collections;
@@ -26,8 +27,8 @@ public final class ProxyEngineTest {
         Routes.Dc dc = Routes.Dc.fromWire((short) 2);
         Routes.Target target = new Routes.Target("example.org", "example.org", "/apiws", null, "WSS");
         RouteHealth health = new RouteHealth();
-        long now = 1000;
         health.succeeded(dc, target);
+        long now = System.nanoTime();
         assertEquals(target, health.preferred(dc));
         health.failed(dc, target, now);
         assertNull(health.preferred(dc));
@@ -54,6 +55,54 @@ public final class ProxyEngineTest {
         history.select(RouteHealth.Kind.CELLULAR).failed(dc, relay, System.nanoTime(), true);
         assertNull(history.select(RouteHealth.Kind.CELLULAR).preferred(dc));
         assertEquals(direct, history.select(RouteHealth.Kind.WIFI).preferred(dc));
+    }
+
+    @Test
+    public void olderFailureDoesNotInvalidateARecentlyAnsweredRoute() {
+        var dc = Routes.Dc.fromWire((short) 2);
+        var target = new Routes.Target("relay.example.org", "relay.example.org", "/apiws", null, "WSS");
+        var health = new RouteHealth();
+        long olderAttempt = System.nanoTime() - TimeUnit.SECONDS.toNanos(1);
+        health.succeeded(dc, target);
+        long now = System.nanoTime();
+        health.failed(dc, target, olderAttempt, now, true);
+        assertEquals(target, health.preferred(dc));
+        assertTrue(health.ready(dc, target, now));
+        health.failed(dc, target, now, System.nanoTime(), true);
+        assertNull(health.preferred(dc));
+        assertFalse(health.ready(dc, target, now));
+    }
+
+    @Test
+    public void keepsTelegramConnectionsSeparateFromInAppProbes() throws Exception {
+        try (ServerSocket relay = new ServerSocket(0)) {
+            var traffic = new ProxyTraffic();
+            try (ProxyEngine engine = start(relay, new CopyOnWriteArrayList<>(), traffic)) {
+                var probePeer = runPeer(relay, true, new CountDownLatch(0));
+                ProxyProbe.check(engine.port(), SECRET, (short) 2);
+                probePeer.get(3, TimeUnit.SECONDS);
+                var clientPeer = runPeer(relay, true, new CountDownLatch(0));
+                try (var client = new Socket()) {
+                    client.connect(new InetSocketAddress("127.0.0.1", engine.port()), 1000);
+                    client.setSoTimeout(3000);
+                    var hello = MtProto.initiate(MtProto.Mode.PADDED, (short) 2, SECRET);
+                    var request = ProxyProbe.request();
+                    client.getOutputStream().write(hello.header());
+                    client.getOutputStream().write(hello.sending().update(request.packet()));
+                    request.verify(MtProto.readPacket(client.getInputStream(), hello.receiving(), MtProto.Mode.PADDED));
+                }
+                clientPeer.get(3, TimeUnit.SECONDS);
+                for (int attempt = 0; attempt < 50 && traffic.count(false, ProxyTraffic.Event.REPLY) == 0; attempt++) {
+                    Thread.sleep(10);
+                }
+                for (boolean probe : new boolean[]{false, true}) {
+                    assertEquals(1, traffic.count(probe, ProxyTraffic.Event.OPENED));
+                    assertEquals(1, traffic.count(probe, ProxyTraffic.Event.ACCEPTED));
+                    assertEquals(1, traffic.count(probe, ProxyTraffic.Event.REQUEST));
+                    assertEquals(1, traffic.count(probe, ProxyTraffic.Event.REPLY));
+                }
+            }
+        }
     }
 
     @Test
@@ -96,10 +145,14 @@ public final class ProxyEngineTest {
     }
 
     private static ProxyEngine start(ServerSocket relay, List<String> journal) throws IOException {
+        return start(relay, journal, new ProxyTraffic());
+    }
+
+    private static ProxyEngine start(ServerSocket relay, List<String> journal, ProxyTraffic traffic) throws IOException {
         relay.setSoTimeout(3000);
         Socks5.Endpoint socks = Socks5.parse("127.0.0.1:" + relay.getLocalPort(), "", "");
         Routes.Config config = new Routes.Config(0, "", Collections.emptyMap(), "", "", false, false, socks, true, false, false);
-        ProxyEngine engine = new ProxyEngine(config, SECRET, journal::add);
+        ProxyEngine engine = new ProxyEngine(config, SECRET, journal::add, traffic);
         new Thread(() -> {
             try {
                 engine.serve();

@@ -89,6 +89,8 @@ final class NetworkDiagnostics {
             .append("\nПубличные домены в диагностике: ").append(includeCommunity)
             .append("\nНа каждое имя проверяется первый полученный адрес каждого семейства.\n")
             .append("MTProto OK означает проверенный ответ на служебный запрос без входа в аккаунт.\n");
+        header.append("\nПрокси до сетевых проверок\n");
+        ProxyStatus.appendTraffic(header);
         if (network == null) {
             return DiagnosticReport.save(context, header.append("\nАктивная сеть отсутствует.\n").toString());
         }
@@ -120,6 +122,8 @@ final class NetworkDiagnostics {
         } finally {
             pool.shutdownNow();
         }
+        header.append("\nПрокси после сетевых проверок\n");
+        ProxyStatus.appendTraffic(header);
         Network endNetwork = manager.getActiveNetwork();
         header.append("\nСеть при завершении: ").append(networkSummary(manager, endNetwork))
             .append("\nСмена сети во время теста: ").append(!Objects.equals(network, endNetwork));

@@ -42,10 +42,12 @@ final class ProxyEngine implements Closeable {
     private static final int CLIENT_LIMIT = 24;
     private static final int CONNECT_TIMEOUT = 3500;
     private static final long ROUTE_HEAD_START = TimeUnit.MILLISECONDS.toNanos(220);
+    private static final long VERIFIED_HEAD_START = TimeUnit.MILLISECONDS.toNanos(900);
     private static final int FIRST_REPLY_TIMEOUT = 6000;
     private final Routes.Config config;
     private final byte[] secret;
     private final Consumer<String> log;
+    private final ProxyTraffic traffic;
     private final ServerSocket listener;
     private final ExecutorService clients = Executors.newFixedThreadPool(CLIENT_LIMIT);
     private final ExecutorService reverse = Executors.newFixedThreadPool(CLIENT_LIMIT);
@@ -60,7 +62,8 @@ final class ProxyEngine implements Closeable {
     private final AtomicInteger rotation = new AtomicInteger();
     private volatile boolean stopped;
 
-    ProxyEngine(Routes.Config config, byte[] secret, Consumer<String> log) throws IOException {
+    ProxyEngine(Routes.Config config, byte[] secret, Consumer<String> log, ProxyTraffic traffic) throws IOException {
+        this.traffic = traffic;
         this.config = config;
         this.secret = secret;
         this.log = log;
@@ -81,7 +84,10 @@ final class ProxyEngine implements Closeable {
     void serve() throws IOException {
         while (!stopped) {
             Socket socket = listener.accept();
+            boolean probe = ProxyProbe.isLocalProbe(socket.getPort());
+            traffic.record(probe, ProxyTraffic.Event.OPENED);
             if (!capacity.tryAcquire()) {
+                traffic.record(probe, ProxyTraffic.Event.LIMIT);
                 quietlyClose(socket);
                 continue;
             }
@@ -92,7 +98,7 @@ final class ProxyEngine implements Closeable {
                     capacity.release();
                     return;
                 }
-                session = new Session(socket, routes);
+                session = new Session(socket, routes, probe);
                 sessions.add(session);
             }
             try {
@@ -110,7 +116,15 @@ final class ProxyEngine implements Closeable {
             client.setTcpNoDelay(true);
             client.setSoTimeout(7000);
             InputStream input = client.getInputStream();
-            MtProto.Hello hello = MtProto.accept(MtProto.readExact(input, MtProto.HEADER_SIZE), secret);
+            byte[] header = MtProto.readExact(input, MtProto.HEADER_SIZE);
+            MtProto.Hello hello;
+            try {
+                hello = MtProto.accept(header, secret);
+            } catch (IOException error) {
+                traffic.record(session.probe, ProxyTraffic.Event.INVALID);
+                throw error;
+            }
+            traffic.record(session.probe, ProxyTraffic.Event.ACCEPTED);
             Routes.Dc targetDc = Routes.Dc.fromWire(hello.dc());
             dc = targetDc;
             client.setSoTimeout(0);
@@ -119,8 +133,11 @@ final class ProxyEngine implements Closeable {
             Connected connected = selectRoute(session, dc);
             long selectionMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - selectionStarted);
             if (connected == null) {
-                if (!session.isClosed() && session.routes.reportNoRoute(dc, System.nanoTime())) {
-                    log.accept(dc.label() + " · нет доступного маршрута");
+                if (!session.isClosed()) {
+                    traffic.record(session.probe, ProxyTraffic.Event.NO_ROUTE);
+                    if (session.routes.reportNoRoute(dc, System.nanoTime())) {
+                        log.accept(dc.label() + " · нет доступного маршрута");
+                    }
                 }
                 return;
             }
@@ -135,6 +152,7 @@ final class ProxyEngine implements Closeable {
             log.accept(dc.label() + " · " + connected.target.description() + " · выбор " + selectionMillis + " мс");
             Socket upstream = connected.socket;
             reverse.execute(() -> readUpstream(session, connected, targetDc, hello, relay));
+            Runnable firstRequest = () -> traffic.record(session.probe, ProxyTraffic.Event.REQUEST);
             Runnable timeout = () -> {
                 if (recordUnanswered(session, targetDc, connected)) {
                     log.accept(targetDc.label() + " · " + connected.target.label() + " · нет первого ответа");
@@ -145,7 +163,9 @@ final class ProxyEngine implements Closeable {
             while (!stopped) {
                 if (connected.webSocket != null) {
                     byte[] packet = MtProto.readPacket(input, hello.incoming(), hello.mode());
-                    session.watchReply(deadlines, timeout);
+                    if (session.watchReply(deadlines, timeout)) {
+                        firstRequest.run();
+                    }
                     connected.webSocket.send(relay.sending().update(packet));
                 } else {
                     int count = input.read(buffer);
@@ -154,7 +174,9 @@ final class ProxyEngine implements Closeable {
                         session.awaitDownstream();
                         break;
                     }
-                    session.watchReply(deadlines, timeout);
+                    if (session.watchReply(deadlines, timeout)) {
+                        firstRequest.run();
+                    }
                     byte[] clear = hello.incoming().update(buffer, 0, count);
                     upstream.getOutputStream().write(relay.sending().update(clear));
                 }
@@ -184,10 +206,11 @@ final class ProxyEngine implements Closeable {
                     return;
                 }
                 byte[] clear = relay.receiving().update(buffer, 0, count);
+                output.write(hello.outgoing().update(clear));
                 if (session.receivedReply()) {
+                    traffic.record(session.probe, ProxyTraffic.Event.REPLY);
                     session.routes.succeeded(dc, connected.target);
                 }
-                output.write(hello.outgoing().update(clear));
             }
         } catch (IOException e) {
             if (connected.webSocket != null && !session.isClosed() && !(e instanceof SocketException)) {
@@ -203,7 +226,8 @@ final class ProxyEngine implements Closeable {
         if (!session.unanswered()) {
             return false;
         }
-        session.routes.failed(dc, connected.target, System.nanoTime(), config.communityAuto());
+        traffic.record(session.probe, ProxyTraffic.Event.NO_REPLY);
+        session.routes.failed(dc, connected.target, session.started, System.nanoTime(), config.communityAuto());
         return true;
     }
 
@@ -246,10 +270,12 @@ final class ProxyEngine implements Closeable {
     private Connected race(Session session, Routes.Dc dc, List<Routes.Target> targets)
         throws InterruptedException {
         ExecutorCompletionService<Connected> results = new ExecutorCompletionService<>(dialing);
-        Map<Future<Connected>, Routes.Target> attempts = new HashMap<>();
+        Map<Future<Connected>, PendingAttempt> attempts = new HashMap<>();
         List<Socket> sockets = new ArrayList<>();
         Connected winner = null;
         List<String> errors = new ArrayList<>();
+        long headStart = config.communityAuto() && targets.get(0).equals(session.routes.preferred(dc))
+            ? VERIFIED_HEAD_START : ROUTE_HEAD_START;
         long nextLaunch = System.nanoTime();
         long deadline = nextLaunch + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT + 550);
         int launched = 0;
@@ -270,14 +296,14 @@ final class ProxyEngine implements Closeable {
                         return null;
                     }
                     try {
-                        attempts.put(results.submit(() -> dial(target, socket)), target);
+                        attempts.put(results.submit(() -> dial(target, socket)), new PendingAttempt(target, now));
                     } catch (RejectedExecutionException ignored) {
                         // Other attempts in this race can still succeed if the dial queue is full.
                         completed++;
                         session.remove(socket);
                         quietlyClose(socket);
                     }
-                    nextLaunch = launched == 1 ? now + ROUTE_HEAD_START : now;
+                    nextLaunch = launched == 1 ? now + headStart : now;
                     continue;
                 }
                 if (launched == completed) {
@@ -294,7 +320,8 @@ final class ProxyEngine implements Closeable {
                     return winner;
                 } catch (ExecutionException e) {
                     if (!session.isClosed()) {
-                        session.routes.failed(dc, attempts.get(result), System.nanoTime(), config.communityAuto());
+                        PendingAttempt failed = attempts.get(result);
+                        session.routes.failed(dc, failed.target, failed.started, System.nanoTime(), config.communityAuto());
                         Throwable cause = e.getCause();
                         errors.add(connectionError(cause));
                     }
@@ -413,9 +440,13 @@ final class ProxyEngine implements Closeable {
 
     private record Connected(Routes.Target target, Socket socket, WebSocketWire webSocket) {}
 
+    private record PendingAttempt(Routes.Target target, long started) {}
+
     private static final class Session implements Closeable {
         final Socket client;
         final RouteHealth routes;
+        final boolean probe;
+        final long started = System.nanoTime();
         private final List<Socket> upstreams = new ArrayList<>();
         private ScheduledFuture<?> replyDeadline;
         private boolean forwarded;
@@ -423,24 +454,27 @@ final class ProxyEngine implements Closeable {
         private boolean failureRecorded;
         private boolean closed;
 
-        Session(Socket client, RouteHealth routes) {
+        Session(Socket client, RouteHealth routes, boolean probe) {
             this.client = client;
             this.routes = routes;
+            this.probe = probe;
         }
 
         synchronized boolean isClosed() {
             return closed;
         }
 
-        synchronized void watchReply(ScheduledThreadPoolExecutor deadlines, Runnable timeout) {
-            if (!closed && !forwarded && !replied) {
-                forwarded = true;
-                replyDeadline = deadlines.schedule(timeout, FIRST_REPLY_TIMEOUT, TimeUnit.MILLISECONDS);
+        synchronized boolean watchReply(ScheduledThreadPoolExecutor deadlines, Runnable timeout) {
+            if (closed || forwarded || replied) {
+                return false;
             }
+            forwarded = true;
+            replyDeadline = deadlines.schedule(timeout, FIRST_REPLY_TIMEOUT, TimeUnit.MILLISECONDS);
+            return true;
         }
 
         synchronized boolean receivedReply() {
-            if (closed || replied || failureRecorded) {
+            if (closed || !forwarded || replied || failureRecorded) {
                 return false;
             }
             replied = true;

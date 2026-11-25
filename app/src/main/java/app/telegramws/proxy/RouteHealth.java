@@ -60,8 +60,10 @@ final class RouteHealth {
     }
 
     void succeeded(Routes.Dc dc, Routes.Target target) {
-        failures.remove(new Key(dc, target));
-        working.put(dc, new Working(target, System.nanoTime()));
+        working.compute(dc, (key, previous) -> {
+            failures.remove(new Key(dc, target));
+            return new Working(target, System.nanoTime());
+        });
     }
 
     void failed(Routes.Dc dc, Routes.Target target, long now) {
@@ -69,13 +71,23 @@ final class RouteHealth {
     }
 
     void failed(Routes.Dc dc, Routes.Target target, long now, boolean coolDownImmediately) {
-        working.computeIfPresent(dc, (key, route) -> route.target.equals(target) ? null : route);
-        failures.compute(new Key(dc, target), (key, previous) -> {
-            int count = previous == null || now - previous.retryAt > TimeUnit.MINUTES.toNanos(2)
-                ? 1 : Math.min(4, previous.count + 1);
-            long wait = count == 1 ? TimeUnit.SECONDS.toNanos(coolDownImmediately ? 4 : 0)
-                : TimeUnit.SECONDS.toNanos(4L << (count - 2));
-            return new Failure(count, now + wait);
+        failed(dc, target, now, now, coolDownImmediately);
+    }
+
+    void failed(Routes.Dc dc, Routes.Target target, long attemptStarted, long now, boolean coolDownImmediately) {
+        working.compute(dc, (key, route) -> {
+            boolean sameRoute = route != null && route.target.equals(target);
+            if (sameRoute && route.observedAt - attemptStarted > 0) {
+                return route;
+            }
+            failures.compute(new Key(dc, target), (attempt, previous) -> {
+                int count = previous == null || now - previous.retryAt > TimeUnit.MINUTES.toNanos(2)
+                    ? 1 : Math.min(4, previous.count + 1);
+                long wait = count == 1 ? TimeUnit.SECONDS.toNanos(coolDownImmediately ? 4 : 0)
+                    : TimeUnit.SECONDS.toNanos(4L << (count - 2));
+                return new Failure(count, now + wait);
+            });
+            return sameRoute ? null : route;
         });
     }
 }
