@@ -17,6 +17,7 @@ import java.net.SocketTimeoutException;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -43,6 +44,10 @@ final class ProxyEngine implements Closeable {
     private static final int CONNECT_TIMEOUT = 3500;
     private static final long ROUTE_HEAD_START = TimeUnit.MILLISECONDS.toNanos(220);
     private static final long VERIFIED_HEAD_START = TimeUnit.MILLISECONDS.toNanos(900);
+    private static final long SCAN_BUDGET = TimeUnit.MILLISECONDS.toNanos(2500);
+    private static final long SELECTION_SCAN_BUDGET = TimeUnit.SECONDS.toNanos(5);
+    private static final long SCAN_TTL = TimeUnit.MINUTES.toNanos(5);
+    private static final long FAILED_SCAN_TTL = TimeUnit.SECONDS.toNanos(30);
     private static final int FIRST_REPLY_TIMEOUT = 6000;
     private final Routes.Config config;
     private final byte[] secret;
@@ -232,6 +237,25 @@ final class ProxyEngine implements Closeable {
     }
 
     private Connected selectRoute(Session session, Routes.Dc dc) throws InterruptedException {
+        if (config.communityAuto()) {
+            long scanDeadline = System.nanoTime() + SELECTION_SCAN_BUDGET;
+            for (Routes.Stage stage : Routes.ordered(dc, config, session.routes.kind, null)) {
+                if (session.isClosed()) {
+                    return null;
+                }
+                for (Routes.Target target : measuredRoutes(session, dc, stage, scanDeadline)) {
+                    if (!session.routes.ready(dc, target, System.nanoTime())) {
+                        continue;
+                    }
+                    Connected picked = race(session, dc, Collections.singletonList(target));
+                    if (picked != null) {
+                        return picked;
+                    }
+                }
+            }
+        }
+
+        // Some servers can forward Telegram traffic even when the synthetic request gets no reply.
         Routes.Target previous = session.routes.preferred(dc);
         for (Routes.Stage stage : Routes.ordered(dc, config, session.routes.kind, previous)) {
             if (session.isClosed()) {
@@ -266,6 +290,104 @@ final class ProxyEngine implements Closeable {
         }
         return null;
     }
+
+    private List<Routes.Target> measuredRoutes(Session session, Routes.Dc dc, Routes.Stage stage, long scanDeadline)
+        throws InterruptedException {
+        RouteHealth.StageScan scan = session.routes.scan(dc, stage);
+        synchronized (scan) {
+            long now = System.nanoTime();
+            if (session.isClosed() || now - scan.expiresAt < 0) {
+                return scan.ranked;
+            }
+            List<Routes.Target> candidates = new ArrayList<>(stage.targets());
+            candidates.removeIf(target -> !session.routes.ready(dc, target, now));
+            int limit = stage.attemptLimit();
+            if (now - scanDeadline >= 0) {
+                return scan.ranked;
+            }
+            if (candidates.size() > limit) {
+                Collections.rotate(candidates, -Math.floorMod(rotation.getAndAdd(limit), candidates.size()));
+                if (!scan.ranked.isEmpty() && candidates.remove(scan.ranked.get(0))) {
+                    candidates.add(0, scan.ranked.get(0));
+                }
+                candidates = candidates.subList(0, limit);
+            }
+
+            long budget = Math.min(SCAN_BUDGET, scanDeadline - now);
+            List<Routes.Target> ranked = rankRoutes(dc, candidates, session, now + budget);
+            if (!session.isClosed() && (!ranked.isEmpty() || budget == SCAN_BUDGET)) {
+                scan.ranked = ranked;
+                scan.expiresAt = System.nanoTime() + (ranked.isEmpty() ? FAILED_SCAN_TTL : SCAN_TTL);
+            }
+            return ranked;
+        }
+    }
+
+    private List<Routes.Target> rankRoutes(Routes.Dc dc, List<Routes.Target> candidates, Session session, long deadline)
+        throws InterruptedException {
+        ExecutorCompletionService<RouteTiming> results = new ExecutorCompletionService<>(dialing);
+        List<Future<RouteTiming>> pending = new ArrayList<>();
+        List<Socket> sockets = new ArrayList<>();
+        List<RouteTiming> timings = new ArrayList<>();
+        try {
+            for (Routes.Target target : candidates) {
+                Socket socket = new Socket(Proxy.NO_PROXY);
+                if (!session.add(socket)) {
+                    quietlyClose(socket);
+                    return Collections.emptyList();
+                }
+                sockets.add(socket);
+                try {
+                    pending.add(results.submit(() -> {
+                        long started = System.nanoTime();
+                        Connected connected = dial(target, socket);
+                        socket.setSoTimeout((int) TimeUnit.NANOSECONDS.toMillis(SCAN_BUDGET));
+                        if (connected.webSocket == null) {
+                            ProxyProbe.verifyRaw(socket, dc.relayId());
+                        } else {
+                            ProxyProbe.verifyWebSocket(connected.webSocket, dc.relayId());
+                        }
+                        return new RouteTiming(target, System.nanoTime() - started);
+                    }));
+                } catch (RejectedExecutionException ignored) {
+                    // A busy proxy can still try the routes it already measured.
+                }
+            }
+
+            for (int i = 0; i < pending.size() && !session.isClosed(); i++) {
+                long remaining = Math.max(0, deadline - System.nanoTime());
+                Future<RouteTiming> result = results.poll(remaining, TimeUnit.NANOSECONDS);
+                if (result == null) {
+                    break;
+                }
+                try {
+                    timings.add(result.get());
+                } catch (ExecutionException ignored) {
+                    // Only routes with a verified MTProto reply qualify for the ranking.
+                }
+            }
+        } finally {
+            pending.forEach(future -> future.cancel(true));
+            for (Socket socket : sockets) {
+                session.remove(socket);
+                quietlyClose(socket);
+            }
+        }
+        return orderedByResponse(timings, candidates);
+    }
+
+    static List<Routes.Target> orderedByResponse(List<RouteTiming> timings, List<Routes.Target> candidates) {
+        List<RouteTiming> ordered = new ArrayList<>(timings);
+        ordered.sort(Comparator.comparingLong(RouteTiming::elapsedNanos)
+            .thenComparingInt(timing -> candidates.indexOf(timing.target)));
+        List<Routes.Target> targets = new ArrayList<>(ordered.size());
+        for (RouteTiming timing : ordered) {
+            targets.add(timing.target);
+        }
+        return Collections.unmodifiableList(targets);
+    }
+
+    record RouteTiming(Routes.Target target, long elapsedNanos) {}
 
     private Connected race(Session session, Routes.Dc dc, List<Routes.Target> targets)
         throws InterruptedException {

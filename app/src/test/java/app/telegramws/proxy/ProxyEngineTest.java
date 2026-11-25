@@ -74,6 +74,36 @@ public final class ProxyEngineTest {
     }
 
     @Test
+    public void ranksVerifiedRoutesByElapsedTimeInsteadOfCompletionOrder() {
+        var slow = new Routes.Target("slow.example.org", "slow.example.org", "/apiws", null, "WSS");
+        var fast = new Routes.Target("fast.example.org", "fast.example.org", "/apiws", null, "WSS");
+        var unanswered = new Routes.Target("silent.example.org", "silent.example.org", "/apiws", null, "WSS");
+        var candidates = List.of(slow, unanswered, fast);
+        var timings = List.of(new ProxyEngine.RouteTiming(slow, 850), new ProxyEngine.RouteTiming(fast, 150));
+        assertEquals(List.of(fast, slow), ProxyEngine.orderedByResponse(timings, candidates));
+    }
+
+    @Test
+    public void verifiesNewRoutesAndReusesTheRankingForTheNextConnection() throws Exception {
+        try (ServerSocket relay = new ServerSocket(0);
+             ProxyEngine engine = start(relay, new CopyOnWriteArrayList<>(), new ProxyTraffic(), true)) {
+            FutureTask<Void> peers = new FutureTask<>(() -> {
+                for (int i = 0; i < 3; i++) {
+                    runPeer(relay, true, new CountDownLatch(0)).get(3, TimeUnit.SECONDS);
+                }
+                return null;
+            });
+            new Thread(peers).start();
+
+            // The first client needs a route measurement and its own connection.
+            assertTrue(ProxyProbe.check(engine.port(), SECRET, (short) 2) >= 0);
+            // The only remaining upstream connection is reserved for the next client.
+            assertTrue(ProxyProbe.check(engine.port(), SECRET, (short) 2) >= 0);
+            peers.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     public void keepsTelegramConnectionsSeparateFromInAppProbes() throws Exception {
         try (ServerSocket relay = new ServerSocket(0)) {
             var traffic = new ProxyTraffic();
@@ -149,9 +179,14 @@ public final class ProxyEngineTest {
     }
 
     private static ProxyEngine start(ServerSocket relay, List<String> journal, ProxyTraffic traffic) throws IOException {
+        return start(relay, journal, traffic, false);
+    }
+
+    private static ProxyEngine start(ServerSocket relay, List<String> journal, ProxyTraffic traffic, boolean automatic)
+        throws IOException {
         relay.setSoTimeout(3000);
         Socks5.Endpoint socks = Socks5.parse("127.0.0.1:" + relay.getLocalPort(), "", "");
-        Routes.Config config = new Routes.Config(0, "", Collections.emptyMap(), "", "", false, false, socks, true, false, false);
+        Routes.Config config = new Routes.Config(0, "", Collections.emptyMap(), "", "", false, false, socks, true, false, automatic);
         ProxyEngine engine = new ProxyEngine(config, SECRET, journal::add, traffic);
         new Thread(() -> {
             try {

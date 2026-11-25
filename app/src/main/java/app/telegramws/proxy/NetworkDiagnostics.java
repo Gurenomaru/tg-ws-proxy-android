@@ -291,13 +291,13 @@ final class NetworkDiagnostics {
             line.append(" TCP OK ").append(elapsed(started)).append(" мс");
             if (target.host() == null) {
                 phase = "MTProto";
-                verifyRaw(raw, check.dc);
+                ProxyProbe.verifyRaw(raw, check.dc);
             } else if (target.port() == 80) {
                 phase = "WS";
                 WebSocketWire ws = new WebSocketWire(raw, target);
                 line.append(" WS 101");
                 phase = "MTProto";
-                verifyWebSocket(ws, check.dc);
+                ProxyProbe.verifyWebSocket(ws, check.dc);
             } else {
                 phase = "TLS";
                 long tlsStart = System.nanoTime();
@@ -309,7 +309,7 @@ final class NetworkDiagnostics {
                     var ws = new WebSocketWire(tls, target);
                     line.append(" WSS 101");
                     phase = "MTProto";
-                    verifyWebSocket(ws, check.dc);
+                    ProxyProbe.verifyWebSocket(ws, check.dc);
                 }
             }
             line.append(" MTProto OK ").append(elapsed(started)).append(" мс всего");
@@ -319,31 +319,6 @@ final class NetworkDiagnostics {
                 .append(" (").append(elapsed(started)).append(" мс всего)");
             return false;
         }
-    }
-
-    private static void verifyRaw(Socket socket, short dc) throws IOException {
-        MtProto.Outbound hello = MtProto.initiate(MtProto.Mode.PADDED, dc, null);
-        ProxyProbe.Request probe = ProxyProbe.request();
-        socket.getOutputStream().write(hello.header());
-        socket.getOutputStream().write(hello.sending().update(probe.packet()));
-        probe.verify(MtProto.readPacket(socket.getInputStream(), hello.receiving(), MtProto.Mode.PADDED));
-    }
-
-    private static void verifyWebSocket(WebSocketWire socket, short dc) throws IOException {
-        MtProto.Outbound hello = MtProto.initiate(MtProto.Mode.PADDED, dc, null);
-        ProxyProbe.Request probe = ProxyProbe.request();
-        socket.send(hello.header());
-        socket.send(hello.sending().update(probe.packet()));
-        byte[] result = new byte[44];
-        int written = 0;
-        while (written < result.length) {
-            byte[] chunk = new byte[result.length - written];
-            int count = socket.receive(chunk);
-            if (count < 0) throw new EOFException();
-            System.arraycopy(chunk, 0, result, written, count);
-            written += count;
-        }
-        probe.verify(hello.receiving().update(result));
     }
 
     private static void appendLocalProxy(StringBuilder report, java.util.concurrent.ExecutorService pool,

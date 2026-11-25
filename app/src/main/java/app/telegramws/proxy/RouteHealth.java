@@ -1,6 +1,8 @@
 package app.telegramws.proxy;
 
+import java.util.Collections;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
@@ -23,6 +25,20 @@ final class RouteHealth {
     final Kind kind;
     private record Key(Routes.Dc dc, Routes.Target target) {}
     private record Failure(int count, long retryAt) {}
+
+    private record StageKey(Routes.Dc dc, Routes.Stage stage) {}
+
+    static final class StageScan {
+        // Accessed while holding the scan's monitor.
+        List<Routes.Target> ranked = Collections.emptyList();
+        long expiresAt = System.nanoTime();
+    }
+
+    private final Map<StageKey, StageScan> scans = new ConcurrentHashMap<>();
+
+    StageScan scan(Routes.Dc dc, Routes.Stage stage) {
+        return scans.computeIfAbsent(new StageKey(dc, stage), key -> new StageScan());
+    }
 
     private final Map<Key, Failure> failures = new ConcurrentHashMap<>();
     private final Map<Routes.Dc, Working> working;
