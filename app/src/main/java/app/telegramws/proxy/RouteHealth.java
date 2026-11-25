@@ -32,11 +32,16 @@ final class RouteHealth {
     }
 
     void failed(Routes.Dc dc, Routes.Target target, long now) {
+        failed(dc, target, now, false);
+    }
+
+    void failed(Routes.Dc dc, Routes.Target target, long now, boolean coolDownImmediately) {
         working.remove(dc, target);
         failures.compute(new Key(dc, target), (key, previous) -> {
             int count = previous == null || now - previous.retryAt > TimeUnit.MINUTES.toNanos(2)
                 ? 1 : Math.min(4, previous.count + 1);
-            long wait = count == 1 ? 0 : TimeUnit.SECONDS.toNanos(4L << (count - 2));
+            long wait = count == 1 ? TimeUnit.SECONDS.toNanos(coolDownImmediately ? 4 : 0)
+                : TimeUnit.SECONDS.toNanos(4L << (count - 2));
             return new Failure(count, now + wait);
         });
     }

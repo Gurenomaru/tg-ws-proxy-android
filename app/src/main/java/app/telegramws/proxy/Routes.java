@@ -67,7 +67,7 @@ final class Routes {
 
     record Config(int port, String secret, Map<Integer, String> overrides, String cloudflare,
                   String worker, boolean community, boolean tcp, Socks5.Endpoint socks, boolean socksFirst,
-                  boolean communityPlain) {}
+                  boolean communityPlain, boolean communityAuto) {}
 
     record Stage(List<Target> targets, int attemptLimit) {
         Stage(List<Target> targets) {
@@ -130,6 +130,41 @@ final class Routes {
             String ipv6 = ipv6Address(dc);
             stages.add(ipv6 == null ? new Stage(ipv4) : new Stage(Arrays.asList(ipv4,
                 new Target(ipv6, ipv6, null, null, "TCP Telegram IPv6"))));
+        }
+        if (config.communityAuto && !dc.test) {
+            if (!config.community) {
+                stages.add(community(dc, 443));
+            }
+            if (!config.communityPlain) {
+                stages.add(community(dc, 80));
+            }
+        }
+        return stages;
+    }
+
+    static List<Stage> ordered(Dc dc, Config config, Target preferred) {
+        List<Stage> stages = candidates(dc, config);
+        if (!config.communityAuto || preferred == null) {
+            return stages;
+        }
+        int first = config.socks != null && config.socksFirst ? 1 : 0;
+        if (config.communityPlain && !dc.test) {
+            first++;
+        }
+        for (int i = first + 1; i < stages.size(); i++) {
+            Stage stage = stages.get(i);
+            if (!stage.targets.contains(preferred)) {
+                continue;
+            }
+            List<Target> rest = new ArrayList<>(stage.targets);
+            rest.remove(preferred);
+            if (rest.isEmpty()) {
+                stages.remove(i);
+            } else {
+                stages.set(i, new Stage(rest, Math.min(stage.attemptLimit, rest.size())));
+            }
+            stages.add(first, new Stage(preferred));
+            break;
         }
         return stages;
     }

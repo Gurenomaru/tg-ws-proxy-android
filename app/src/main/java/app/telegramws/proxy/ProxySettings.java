@@ -36,7 +36,16 @@ final class ProxySettings {
         return new Routes.Config(port(), secret, parseIps(ips()),
             values.getString("cloudflare", ""), values.getString("worker", ""),
             values.getBoolean("community", false), values.getBoolean("tcp", true),
-            loadSocks(), values.getBoolean("socksFirst", false), values.getBoolean("communityPlain", false));
+            loadSocks(), values.getBoolean("socksFirst", false), values.getBoolean("communityPlain", false),
+            values.getBoolean("communityAuto", false));
+    }
+
+    boolean hasAutomaticRouteChoice() {
+        return values.contains("communityAuto");
+    }
+
+    void setAutomaticRoutes(boolean enabled) {
+        values.edit().putBoolean("communityAuto", enabled).apply();
     }
 
     int port() {
@@ -62,7 +71,7 @@ final class ProxySettings {
 
     void save(String port, String ips, String cloudflare, String worker, boolean community, boolean tcp,
               String socksAddress, String socksUser, String socksPassword, boolean socksFirst,
-              boolean communityPlain) {
+              boolean communityPlain, boolean communityAuto) {
         int parsedPort;
         try {
             parsedPort = Integer.parseInt(port.trim());
@@ -91,6 +100,7 @@ final class ProxySettings {
             .putString("cloudflare", cfHost).putString("worker", workerHost)
             .putBoolean("community", community).putBoolean("tcp", tcp)
             .putBoolean("communityPlain", communityPlain)
+            .putBoolean("communityAuto", communityAuto)
             .putBoolean("socksFirst", socks != null && socksFirst).apply();
     }
 

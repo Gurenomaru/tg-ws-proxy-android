@@ -200,13 +200,13 @@ final class ProxyEngine implements Closeable {
         if (!session.unanswered()) {
             return false;
         }
-        session.routes.failed(dc, connected.target, System.nanoTime());
+        session.routes.failed(dc, connected.target, System.nanoTime(), config.communityAuto());
         return true;
     }
 
     private Connected selectRoute(Session session, Routes.Dc dc) throws InterruptedException {
         Routes.Target previous = session.routes.preferred(dc);
-        for (Routes.Stage stage : Routes.candidates(dc, config)) {
+        for (Routes.Stage stage : Routes.ordered(dc, config, previous)) {
             if (session.isClosed()) {
                 return null;
             }
@@ -224,7 +224,7 @@ final class ProxyEngine implements Closeable {
                 continue;
             }
             Connected picked = race(session, dc, choices.subList(0, Math.min(limit, choices.size())));
-            if (picked == null && !session.isClosed()) {
+            if (picked == null && !config.communityAuto() && !session.isClosed()) {
                 long retryAt = System.nanoTime();
                 for (Routes.Target target : choices) {
                     if (target.sni() != null && session.routes.ready(dc, target, retryAt)) {
@@ -291,7 +291,7 @@ final class ProxyEngine implements Closeable {
                     return winner;
                 } catch (ExecutionException e) {
                     if (!session.isClosed()) {
-                        session.routes.failed(dc, attempts.get(result), System.nanoTime());
+                        session.routes.failed(dc, attempts.get(result), System.nanoTime(), config.communityAuto());
                         Throwable cause = e.getCause();
                         errors.add(connectionError(cause));
                     }

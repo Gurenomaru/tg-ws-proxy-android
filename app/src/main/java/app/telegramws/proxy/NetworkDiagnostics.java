@@ -81,6 +81,7 @@ final class NetworkDiagnostics {
             .append("\nСеть на старте: ").append(networkSummary(manager, network))
             .append("\nНастройки: публичные WSS=").append(config.community())
             .append(", Flowseal WS:80=").append(config.communityPlain())
+            .append(", авторезерв Flowseal=").append(config.communityAuto())
             .append(", прямой TCP=").append(config.tcp())
             .append(", Cloudflare=").append(!config.cloudflare().isEmpty())
             .append(", Worker=").append(!config.worker().isEmpty())

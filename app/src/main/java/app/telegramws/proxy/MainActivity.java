@@ -218,18 +218,39 @@ public final class MainActivity extends Activity {
 
     private void toggle() {
         ProxyStatus.Phase phase = ProxyStatus.snapshot().phase();
-        Intent service = new Intent(this, ProxyService.class);
         if (phase == ProxyStatus.Phase.RUNNING || phase == ProxyStatus.Phase.STARTING) {
-            stopService(service);
+            stopService(new Intent(this, ProxyService.class));
+            updateAfterToggle();
+        } else if (settings.hasAutomaticRouteChoice()) {
+            startProxy();
         } else {
-            startForegroundService(service.setAction(ProxyService.START));
-            if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED
-                && !getPreferences(MODE_PRIVATE).getBoolean("notificationsAsked", false)) {
-                getPreferences(MODE_PRIVATE).edit().putBoolean("notificationsAsked", true).apply();
-                requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 1);
-            }
+            new AlertDialog.Builder(this).setTitle("Добавить автоматический резерв?")
+                .setMessage("Если прямое подключение не отвечает, прокси подберёт маршрут через публичные "
+                    + "серверы Flowseal. Эти серверы видят IP и время подключения. При необходимости "
+                    + "используется порт 80 без внешнего TLS. Выбор можно изменить в настройках маршрутов.")
+                .setPositiveButton("Разрешить резерв", (dialog, which) -> startWithAutomaticRoutes(true))
+                .setNegativeButton("Оставить мои настройки", (dialog, which) -> startWithAutomaticRoutes(false))
+                .show();
         }
+    }
+
+    private void startWithAutomaticRoutes(boolean enabled) {
+        settings.setAutomaticRoutes(enabled);
+        startProxy();
+    }
+
+    private void startProxy() {
+        startForegroundService(new Intent(this, ProxyService.class).setAction(ProxyService.START));
+        if (Build.VERSION.SDK_INT >= 33 && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+            != PackageManager.PERMISSION_GRANTED
+            && !getPreferences(MODE_PRIVATE).getBoolean("notificationsAsked", false)) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("notificationsAsked", true).apply();
+            requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 1);
+        }
+        updateAfterToggle();
+    }
+
+    private void updateAfterToggle() {
         busyUntil = android.os.SystemClock.uptimeMillis() + 550;
         render();
     }
@@ -320,6 +341,9 @@ public final class MainActivity extends Activity {
         add(form, text("Одна пара DC:IPv4 на строку. Пустое поле включает обычный DNS.", 13, MUTED), 10);
         EditText cf = field(form, "Домен Cloudflare", current.cloudflare(), InputType.TYPE_TEXT_VARIATION_URI);
         EditText worker = field(form, "Домен Cloudflare Worker", current.worker(), InputType.TYPE_TEXT_VARIATION_URI);
+        CheckBox communityAuto = check(form, "Автовыбор с резервом Flowseal", current.communityAuto());
+        add(form, text("Пробует публичные серверы, если обычные маршруты не работают. Их операторы видят IP. "
+            + "На порту 80 сохраняется шифрование MTProto без внешнего TLS.", 13, MUTED), 10);
         CheckBox community = check(form, "Резервные домены Flowseal (WSS)", current.community());
         CheckBox communityPlain = check(form, "Мобильный режим Flowseal (WS, порт 80)", current.communityPlain());
         add(form, text("Сначала пробует публичные домены Flowseal. Этот маршрут работает без TLS, "
@@ -346,7 +370,8 @@ public final class MainActivity extends Activity {
                 settings.save(port.getText().toString(), ips.getText().toString(), cf.getText().toString(),
                     worker.getText().toString(), community.isChecked(), tcp.isChecked(),
                     socksAddress.getText().toString(), socksUser.getText().toString(),
-                    socksPassword.getText().toString(), socksFirst.isChecked(), communityPlain.isChecked());
+                    socksPassword.getText().toString(), socksFirst.isChecked(), communityPlain.isChecked(),
+                    communityAuto.isChecked());
                 dialog.dismiss();
                 render();
             } catch (IllegalArgumentException e) {
