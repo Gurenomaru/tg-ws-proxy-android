@@ -8,6 +8,7 @@ import android.app.Service;
 import android.content.Intent;
 import android.net.ConnectivityManager;
 import android.net.Network;
+import android.net.NetworkCapabilities;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
@@ -29,20 +30,32 @@ public final class ProxyService extends Service {
     private boolean started;
     private boolean watchingNetwork;
     private Network defaultNetwork;
+    private Network reportedNetwork;
+    private RouteHealth.Kind networkKind = RouteHealth.Kind.OTHER;
     private final ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
         @Override
         public void onAvailable(Network network) {
-            if (defaultNetwork != null && !defaultNetwork.equals(network)) {
-                resetNetwork("Сеть сменилась · переподключение");
+            reportedNetwork = network;
+        }
+
+        @Override
+        public void onCapabilitiesChanged(Network network, NetworkCapabilities capabilities) {
+            if (!network.equals(reportedNetwork)) {
+                return;
             }
-            defaultNetwork = network;
+            RouteHealth.Kind kind = kindOf(capabilities);
+            if (!network.equals(defaultNetwork) || kind != networkKind) {
+                changeNetwork(network, kind, "Сеть сменилась · переподключение");
+            }
         }
 
         @Override
         public void onLost(Network network) {
+            if (network.equals(reportedNetwork)) {
+                reportedNetwork = null;
+            }
             if (network.equals(defaultNetwork)) {
-                defaultNetwork = null;
-                resetNetwork("Сеть недоступна · соединения сброшены");
+                changeNetwork(null, RouteHealth.Kind.OTHER, "Сеть недоступна · соединения сброшены");
             }
         }
     };
@@ -68,7 +81,11 @@ public final class ProxyService extends Service {
         Routes.Config config = new ProxySettings(this).load();
         ProxyStatus.phase(ProxyStatus.Phase.STARTING, 0, "");
         startForeground(NOTIFICATION, notification(getString(R.string.notification_starting), ""));
-        getSystemService(ConnectivityManager.class).registerDefaultNetworkCallback(networkCallback, main);
+        ConnectivityManager connectivity = getSystemService(ConnectivityManager.class);
+        defaultNetwork = connectivity.getActiveNetwork();
+        reportedNetwork = defaultNetwork;
+        networkKind = defaultNetwork == null ? RouteHealth.Kind.OTHER : kindOf(connectivity.getNetworkCapabilities(defaultNetwork));
+        connectivity.registerDefaultNetworkCallback(networkCallback, main);
         watchingNetwork = true;
         executor.execute(() -> run(config));
         return START_NOT_STICKY;
@@ -80,6 +97,7 @@ public final class ProxyService extends Service {
                 if (destroyed) {
                     return;
                 }
+                created.networkChanged(networkKind);
                 engine = created;
             }
             main.post(() -> {
@@ -105,13 +123,28 @@ public final class ProxyService extends Service {
         }
     }
 
-    private void resetNetwork(String reason) {
+    private void changeNetwork(Network network, RouteHealth.Kind kind, String reason) {
         synchronized (lock) {
+            defaultNetwork = network;
+            networkKind = kind;
             if (!destroyed && engine != null) {
                 ProxyStatus.log(reason);
-                engine.networkChanged();
+                engine.networkChanged(kind);
             }
         }
+    }
+
+    private static RouteHealth.Kind kindOf(NetworkCapabilities capabilities) {
+        if (capabilities == null || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+            return RouteHealth.Kind.OTHER;
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+            return RouteHealth.Kind.WIFI;
+        }
+        if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+            return RouteHealth.Kind.CELLULAR;
+        }
+        return RouteHealth.Kind.OTHER;
     }
 
     private Notification notification(String title, String detail) {

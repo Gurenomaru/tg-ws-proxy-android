@@ -18,6 +18,7 @@ import java.net.UnknownHostException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -41,7 +42,7 @@ import javax.net.ssl.SSLException;
 final class ProxyEngine implements Closeable {
     private static final int CLIENT_LIMIT = 24;
     private static final int CONNECT_TIMEOUT = 3500;
-    private static final long ROUTE_HEAD_START = TimeUnit.MILLISECONDS.toNanos(220);
+    private static final int ROUTE_HEAD_START_MS = 220;
     private static final int FIRST_REPLY_TIMEOUT = 6000;
     private final Routes.Config config;
     private final byte[] secret;
@@ -55,6 +56,7 @@ final class ProxyEngine implements Closeable {
     private final Object networkLock = new Object();
     private final Set<Session> sessions = ConcurrentHashMap.newKeySet();
     private final Semaphore capacity = new Semaphore(CLIENT_LIMIT);
+    private final RouteHealth.ByNetwork routeHistory = new RouteHealth.ByNetwork();
     private RouteHealth routes = new RouteHealth();
     private final AtomicInteger rotation = new AtomicInteger();
     private volatile boolean stopped;
@@ -114,7 +116,9 @@ final class ProxyEngine implements Closeable {
             dc = targetDc;
             client.setSoTimeout(0);
 
+            long selectionStarted = System.nanoTime();
             Connected connected = selectRoute(session, dc);
+            long selectionMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - selectionStarted);
             if (connected == null) {
                 if (!session.isClosed() && session.routes.reportNoRoute(dc, System.nanoTime())) {
                     log.accept(dc.label() + " · нет доступного маршрута");
@@ -129,7 +133,7 @@ final class ProxyEngine implements Closeable {
                 connected.webSocket.send(relay.header());
             }
 
-            log.accept(dc.label() + " · " + connected.target.description());
+            log.accept(dc.label() + " · " + connected.target.description() + " · выбор " + selectionMillis + " мс");
             Socket upstream = connected.socket;
             reverse.execute(() -> readUpstream(session, connected, targetDc, hello, relay));
             Runnable timeout = () -> {
@@ -206,12 +210,39 @@ final class ProxyEngine implements Closeable {
 
     private Connected selectRoute(Session session, Routes.Dc dc) throws InterruptedException {
         Routes.Target previous = session.routes.preferred(dc);
+        Set<Routes.Target> attempted = Collections.emptySet();
+        if (session.routes.kind == RouteHealth.Kind.CELLULAR && Routes.useMobileRace(dc, config)) {
+            attempted = new HashSet<>();
+            if (previous != null && session.routes.ready(dc, previous, System.nanoTime())) {
+                attempted.add(previous);
+                Connected saved = raceScheduled(session, dc,
+                    Collections.singletonList(new Routes.Attempt(previous, 0)), 2500, previous.label());
+                if (saved != null || session.isClosed()) {
+                    return saved;
+                }
+                if (previous.equals(session.routes.preferred(dc))) {
+                    session.routes.failed(dc, previous, System.nanoTime(), true);
+                }
+            }
+            List<Routes.Attempt> mobile = Routes.mobileAttempts(Routes.candidates(dc, config), rotation.getAndAdd(2));
+            Set<Routes.Target> alreadyTried = attempted;
+            mobile.removeIf(choice -> alreadyTried.contains(choice.target())
+                || !session.routes.ready(dc, choice.target(), System.nanoTime()));
+            if (!mobile.isEmpty()) {
+                mobile.forEach(choice -> alreadyTried.add(choice.target()));
+                Connected quick = raceScheduled(session, dc, mobile, CONNECT_TIMEOUT + 1350, "Подбор маршрута 4G");
+                if (quick != null || session.isClosed()) {
+                    return quick;
+                }
+            }
+        }
         for (Routes.Stage stage : Routes.ordered(dc, config, previous)) {
             if (session.isClosed()) {
                 return null;
             }
             List<Routes.Target> choices = new ArrayList<>(stage.targets());
             long now = System.nanoTime();
+            choices.removeAll(attempted);
             choices.removeIf(target -> !session.routes.ready(dc, target, now));
             int limit = stage.attemptLimit();
             if (choices.size() > limit) {
@@ -242,13 +273,22 @@ final class ProxyEngine implements Closeable {
 
     private Connected race(Session session, Routes.Dc dc, List<Routes.Target> targets)
         throws InterruptedException {
+        List<Routes.Attempt> schedule = new ArrayList<>(targets.size());
+        for (int index = 0; index < targets.size(); index++) {
+            schedule.add(new Routes.Attempt(targets.get(index), index == 0 ? 0 : ROUTE_HEAD_START_MS));
+        }
+        return raceScheduled(session, dc, schedule, CONNECT_TIMEOUT + 550, targets.get(0).label());
+    }
+
+    private Connected raceScheduled(Session session, Routes.Dc dc, List<Routes.Attempt> schedule,
+                                    int budgetMs, String label) throws InterruptedException {
         ExecutorCompletionService<Connected> results = new ExecutorCompletionService<>(dialing);
         Map<Future<Connected>, Routes.Target> attempts = new HashMap<>();
         List<Socket> sockets = new ArrayList<>();
         Connected winner = null;
         List<String> errors = new ArrayList<>();
-        long nextLaunch = System.nanoTime();
-        long deadline = nextLaunch + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT + 550);
+        long started = System.nanoTime();
+        long deadline = started + TimeUnit.MILLISECONDS.toNanos(budgetMs);
         int launched = 0;
         int completed = 0;
         try {
@@ -258,9 +298,11 @@ final class ProxyEngine implements Closeable {
                     errors.add("тайм-аут");
                     break;
                 }
-                boolean hasAlternatives = launched < targets.size();
+                boolean hasAlternatives = launched < schedule.size();
+                long nextLaunch = hasAlternatives
+                    ? started + TimeUnit.MILLISECONDS.toNanos(schedule.get(launched).waitMillis()) : deadline;
                 if (hasAlternatives && (now - nextLaunch >= 0 || launched == completed)) {
-                    Routes.Target target = targets.get(launched++);
+                    Routes.Target target = schedule.get(launched++).target();
                     Socket socket = new Socket(Proxy.NO_PROXY);
                     sockets.add(socket);
                     if (!session.add(socket)) {
@@ -274,7 +316,6 @@ final class ProxyEngine implements Closeable {
                         session.remove(socket);
                         quietlyClose(socket);
                     }
-                    nextLaunch = launched == 1 ? now + ROUTE_HEAD_START : now;
                     continue;
                 }
                 if (launched == completed) {
@@ -295,11 +336,10 @@ final class ProxyEngine implements Closeable {
                         Throwable cause = e.getCause();
                         errors.add(connectionError(cause));
                     }
-                    nextLaunch = System.nanoTime();
                 }
             }
             if (!session.isClosed() && !errors.isEmpty()) {
-                log.accept(dc.label() + " · " + targets.get(0).label() + " · " + String.join(" / ", errors));
+                log.accept(dc.label() + " · " + label + " · " + String.join(" / ", errors));
             }
         } finally {
             for (Future<Connected> future : attempts.keySet()) {
@@ -364,9 +404,13 @@ final class ProxyEngine implements Closeable {
     }
 
     void networkChanged() {
+        networkChanged(RouteHealth.Kind.OTHER);
+    }
+
+    void networkChanged(RouteHealth.Kind kind) {
         List<Session> stale;
         synchronized (networkLock) {
-            routes = new RouteHealth();
+            routes = config.communityAuto() ? routeHistory.select(kind) : new RouteHealth();
             rotation.set(0);
             stale = new ArrayList<>(sessions);
         }

@@ -51,7 +51,9 @@ public final class MainActivity extends Activity {
     private ProxySettings settings;
     private TextView status, address, description, probeStatus;
     private Button toggle, connect, copy, probe, edit;
-    private Button diagnostics, shareReport;
+    private Button diagnostics, shareReport, updateCheck;
+    private int handledUpdate;
+    private boolean manualUpdate;
     private int announcedDiagnostics;
     private long busyUntil;
 
@@ -124,13 +126,16 @@ public final class MainActivity extends Activity {
         add(page, shareReport, 7);
         add(page, button("Журнал соединений", false, v -> openJournal()), 7);
         edit = button("Настройки маршрутов", false, v -> openSettings());
-        add(page, edit, 0);
+        add(page, edit, 7);
+        updateCheck = button("Проверить обновления", false, v -> checkForUpdate());
+        add(page, updateCheck, 0);
         render();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        ReleaseUpdates.check(this, false);
         ui.removeCallbacks(update);
         update.run();
     }
@@ -167,6 +172,52 @@ public final class MainActivity extends Activity {
         probeStatus.setVisibility(view.probe().isEmpty() ? View.GONE : View.VISIBLE);
         probeStatus.setText(view.probe());
         renderDiagnostics();
+        renderUpdate();
+    }
+
+    private void checkForUpdate() {
+        ReleaseUpdates.Available found = ReleaseUpdates.status().available();
+        if (found != null) {
+            offerUpdate(found);
+        } else {
+            manualUpdate = ReleaseUpdates.check(this, true);
+            renderUpdate();
+        }
+    }
+
+    private void renderUpdate() {
+        var status = ReleaseUpdates.status();
+        var found = status.available();
+        updateCheck.setEnabled(!status.running());
+        updateCheck.setText(status.running() ? "Проверяем обновления…"
+            : found == null ? "Проверить обновления" : "Доступна версия " + found.version());
+        if (status.id() == 0 || status.running() || status.id() == handledUpdate || !hasWindowFocus()) {
+            return;
+        }
+        handledUpdate = status.id();
+        if (found != null) {
+            var preferences = getSharedPreferences("release_updates", MODE_PRIVATE);
+            if (manualUpdate || !found.version().equals(preferences.getString("lastOffered", ""))) {
+                preferences.edit().putString("lastOffered", found.version()).apply();
+                offerUpdate(found);
+            }
+        } else if (manualUpdate) {
+            toast(status.failed() ? "Не удалось проверить обновления" : "Установлена актуальная версия");
+        }
+        manualUpdate = false;
+    }
+
+    private void offerUpdate(ReleaseUpdates.Available release) {
+        new AlertDialog.Builder(this).setTitle("Доступна версия " + release.version())
+            .setMessage("На странице релиза GitHub есть описание изменений и подписанный APK.")
+            .setPositiveButton("Открыть релиз", (dialog, which) -> {
+                try {
+                    startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(release.releaseUrl())));
+                } catch (ActivityNotFoundException e) {
+                    toast("На устройстве нет браузера");
+                }
+            })
+            .setNegativeButton("Позже", null).show();
     }
 
     private void renderDiagnostics() {
@@ -293,7 +344,7 @@ public final class MainActivity extends Activity {
     private CompletableFuture<String> probeRoute(int port, byte[] key, short dc, String label) {
         return CompletableFuture.supplyAsync(() -> {
             try {
-                return label + " · " + ProxyProbe.check(port, key, dc) + " мс";
+                return label + " · " + ProxyProbe.check(port, key, dc) + " мс до ответа";
             } catch (IOException e) {
                 return label + " · нет ответа";
             }

@@ -1,16 +1,41 @@
 package app.telegramws.proxy;
 
+import java.util.EnumMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 final class RouteHealth {
+    enum Kind { CELLULAR, WIFI, OTHER }
+
+    static final class ByNetwork {
+        private final Map<Kind, Map<Routes.Dc, Working>> working = new EnumMap<>(Kind.class);
+
+        synchronized RouteHealth select(Kind kind) {
+            Map<Routes.Dc, Working> saved = kind == Kind.OTHER ? new ConcurrentHashMap<>()
+                : working.computeIfAbsent(kind, ignored -> new ConcurrentHashMap<>());
+            return new RouteHealth(kind, saved);
+        }
+    }
+
+    private record Working(Routes.Target target, long observedAt) {}
+
+    final Kind kind;
     private record Key(Routes.Dc dc, Routes.Target target) {}
     private record Failure(int count, long retryAt) {}
 
     private final Map<Key, Failure> failures = new ConcurrentHashMap<>();
-    private final Map<Routes.Dc, Routes.Target> working = new ConcurrentHashMap<>();
+    private final Map<Routes.Dc, Working> working;
     private final Map<Routes.Dc, Long> lastNoRoute = new ConcurrentHashMap<>();
+
+    RouteHealth() {
+        this(Kind.OTHER, new ConcurrentHashMap<>());
+    }
+
+    private RouteHealth(Kind kind, Map<Routes.Dc, Working> working) {
+        this.kind = kind;
+        this.working = working;
+    }
 
     boolean reportNoRoute(Routes.Dc dc, long now) {
         Long last = lastNoRoute.putIfAbsent(dc, now);
@@ -18,7 +43,15 @@ final class RouteHealth {
     }
 
     Routes.Target preferred(Routes.Dc dc) {
-        return working.get(dc);
+        Working route = working.get(dc);
+        if (route == null) {
+            return null;
+        }
+        if (System.nanoTime() - route.observedAt > TimeUnit.MINUTES.toNanos(15)) {
+            working.remove(dc, route);
+            return null;
+        }
+        return route.target;
     }
 
     boolean ready(Routes.Dc dc, Routes.Target target, long now) {
@@ -28,7 +61,7 @@ final class RouteHealth {
 
     void succeeded(Routes.Dc dc, Routes.Target target) {
         failures.remove(new Key(dc, target));
-        working.put(dc, target);
+        working.put(dc, new Working(target, System.nanoTime()));
     }
 
     void failed(Routes.Dc dc, Routes.Target target, long now) {
@@ -36,7 +69,7 @@ final class RouteHealth {
     }
 
     void failed(Routes.Dc dc, Routes.Target target, long now, boolean coolDownImmediately) {
-        working.remove(dc, target);
+        working.computeIfPresent(dc, (key, route) -> route.target.equals(target) ? null : route);
         failures.compute(new Key(dc, target), (key, previous) -> {
             int count = previous == null || now - previous.retryAt > TimeUnit.MINUTES.toNanos(2)
                 ? 1 : Math.min(4, previous.count + 1);

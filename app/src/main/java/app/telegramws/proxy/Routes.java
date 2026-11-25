@@ -169,6 +169,34 @@ final class Routes {
         return stages;
     }
 
+    record Attempt(Target target, long waitMillis) {}
+
+    static boolean useMobileRace(Dc dc, Config config) {
+        return config.communityAuto && !dc.test && tcpAddress(dc) != null && config.socks == null
+            && config.worker.isEmpty() && config.cloudflare.isEmpty()
+            && !config.community && !config.communityPlain;
+    }
+
+    static List<Attempt> mobileAttempts(List<Stage> stages, int rotation) {
+        var attempts = new ArrayList<Attempt>();
+        List<Target> direct = stages.get(0).targets;
+        for (int i = 0; i < direct.size(); i++) {
+            if (i < 2 || i >= direct.size() - 2) {
+                attempts.add(new Attempt(direct.get(i), i == 0 ? 0 : 220));
+            }
+        }
+        addRelayAttempts(attempts, stages.get(stages.size() - 2), rotation, 600);
+        addRelayAttempts(attempts, stages.get(stages.size() - 1), rotation, 1000);
+        return attempts;
+    }
+
+    private static void addRelayAttempts(List<Attempt> attempts, Stage stage, int rotation, long wait) {
+        for (int index = 0; index < 2; index++) {
+            int position = Math.floorMod(rotation + index, stage.targets.size());
+            attempts.add(new Attempt(stage.targets.get(position), wait));
+        }
+    }
+
     private static void addDnsRoutes(List<Target> targets, String host, String path) {
         targets.add(new Target(host, host, path, null, "WSS Telegram IPv6", false, 443, Family.IPV6));
         targets.add(new Target(host, host, path, null, "WSS Telegram IPv4", false, 443, Family.IPV4));

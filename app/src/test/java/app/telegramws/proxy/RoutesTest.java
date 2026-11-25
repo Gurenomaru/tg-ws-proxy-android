@@ -63,4 +63,21 @@ public final class RoutesTest {
         assertEquals(Collections.singletonList(relay), remembered.get(0).targets());
         assertEquals(1, remembered.stream().flatMap(stage -> stage.targets().stream()).filter(relay::equals).count());
     }
+    @Test
+    public void mobileRelayStartsWhileDirectConnectionIsStillPending() {
+        Routes.Config auto = new Routes.Config(1443, "", Collections.emptyMap(),
+            "", "", false, true, null, false, false, true);
+        var dc = Routes.Dc.fromWire((short) 2);
+        var chosen = Routes.mobileAttempts(Routes.candidates(dc, auto), 0);
+        assertEquals(true, Routes.useMobileRace(dc, auto));
+        assertEquals(false, Routes.useMobileRace(Routes.Dc.fromWire((short) 42), auto));
+        assertEquals(0, chosen.get(0).waitMillis());
+        assertEquals("kws2.pclead.co.uk", chosen.get(2).target().host());
+        assertEquals(443, chosen.get(2).target().port());
+        assertEquals(600, chosen.get(2).waitMillis());
+        int plain = chosen.size() - 2;
+        assertEquals(80, chosen.get(plain).target().port());
+        assertEquals(1000, chosen.get(plain).waitMillis());
+        assertEquals(6, chosen.size());
+    }
 }

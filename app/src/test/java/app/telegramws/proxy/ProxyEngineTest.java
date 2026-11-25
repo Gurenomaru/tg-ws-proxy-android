@@ -40,6 +40,23 @@ public final class ProxyEngineTest {
     }
 
     @Test
+    public void returningToMobileRestoresItsOwnWorkingRoute() {
+        var history = new RouteHealth.ByNetwork();
+        var dc = Routes.Dc.fromWire((short) 2);
+        var relay = new Routes.Target("relay.example.org", "relay.example.org", "/apiws", null, "WS", false, 80);
+        var direct = new Routes.Target("direct.example.org", "direct.example.org", "/apiws", null, "WSS");
+        history.select(RouteHealth.Kind.WIFI).succeeded(dc, direct);
+        var mobile = history.select(RouteHealth.Kind.CELLULAR);
+        assertNull(mobile.preferred(dc));
+        mobile.succeeded(dc, relay);
+        assertEquals(direct, history.select(RouteHealth.Kind.WIFI).preferred(dc));
+        assertEquals(relay, history.select(RouteHealth.Kind.CELLULAR).preferred(dc));
+        history.select(RouteHealth.Kind.CELLULAR).failed(dc, relay, System.nanoTime(), true);
+        assertNull(history.select(RouteHealth.Kind.CELLULAR).preferred(dc));
+        assertEquals(direct, history.select(RouteHealth.Kind.WIFI).preferred(dc));
+    }
+
+    @Test
     public void relaysMtProtoThroughPreferredSocksAndClosesSessionsOnNetworkChange() throws Exception {
         try (ServerSocket relay = new ServerSocket(0)) {
             List<String> journal = new CopyOnWriteArrayList<>();
