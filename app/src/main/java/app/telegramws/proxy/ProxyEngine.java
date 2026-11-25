@@ -37,6 +37,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
+import java.util.function.LongConsumer;
 import javax.net.ssl.SSLException;
 
 final class ProxyEngine implements Closeable {
@@ -53,6 +54,7 @@ final class ProxyEngine implements Closeable {
     private final byte[] secret;
     private final Consumer<String> log;
     private final ProxyTraffic traffic;
+    private final RelayWatchdog.Timing watchdogTiming;
     private final ServerSocket listener;
     private final ExecutorService clients = Executors.newFixedThreadPool(CLIENT_LIMIT);
     private final ExecutorService reverse = Executors.newFixedThreadPool(CLIENT_LIMIT);
@@ -68,7 +70,13 @@ final class ProxyEngine implements Closeable {
     private volatile boolean stopped;
 
     ProxyEngine(Routes.Config config, byte[] secret, Consumer<String> log, ProxyTraffic traffic) throws IOException {
+        this(config, secret, log, traffic, RelayWatchdog.DEFAULT);
+    }
+
+    ProxyEngine(Routes.Config config, byte[] secret, Consumer<String> log, ProxyTraffic traffic,
+                RelayWatchdog.Timing watchdogTiming) throws IOException {
         this.traffic = traffic;
+        this.watchdogTiming = watchdogTiming;
         this.config = config;
         this.secret = secret;
         this.log = log;
@@ -156,8 +164,13 @@ final class ProxyEngine implements Closeable {
 
             log.accept(dc.label() + " · " + connected.target.description() + " · выбор " + selectionMillis + " мс");
             Socket upstream = connected.socket;
-            reverse.execute(() -> readUpstream(session, connected, targetDc, hello, relay));
-            Runnable firstRequest = () -> traffic.record(session.probe, ProxyTraffic.Event.REQUEST);
+            RelayWatchdog watchdog = new RelayWatchdog(deadlines, dialing,
+                connected.webSocket == null ? null : connected.webSocket::ping,
+                since -> recoverStalledSession(session, targetDc, connected, since), watchdogTiming);
+            if (!session.watch(watchdog)) {
+                return;
+            }
+            reverse.execute(() -> readUpstream(session, connected, targetDc, hello, relay, watchdog));
             Runnable timeout = () -> {
                 if (recordUnanswered(session, targetDc, connected)) {
                     log.accept(targetDc.label() + " · " + connected.target.label() + " · нет первого ответа");
@@ -169,8 +182,9 @@ final class ProxyEngine implements Closeable {
                 if (connected.webSocket != null) {
                     byte[] packet = MtProto.readPacket(input, hello.incoming(), hello.mode());
                     if (session.watchReply(deadlines, timeout)) {
-                        firstRequest.run();
+                        traffic.record(session.probe, ProxyTraffic.Event.REQUEST);
                     }
+                    watchdog.sent();
                     connected.webSocket.send(relay.sending().update(packet));
                 } else {
                     int count = input.read(buffer);
@@ -180,8 +194,9 @@ final class ProxyEngine implements Closeable {
                         break;
                     }
                     if (session.watchReply(deadlines, timeout)) {
-                        firstRequest.run();
+                        traffic.record(session.probe, ProxyTraffic.Event.REQUEST);
                     }
+                    watchdog.sent();
                     byte[] clear = hello.incoming().update(buffer, 0, count);
                     upstream.getOutputStream().write(relay.sending().update(clear));
                 }
@@ -200,16 +215,18 @@ final class ProxyEngine implements Closeable {
     }
 
     private void readUpstream(Session session, Connected connected, Routes.Dc dc,
-                              MtProto.Hello hello, MtProto.Outbound relay) {
+                              MtProto.Hello hello, MtProto.Outbound relay, RelayWatchdog watchdog) {
         try {
             OutputStream output = session.client.getOutputStream();
             InputStream input = connected.socket.getInputStream();
             byte[] buffer = new byte[32 * 1024];
+            LongConsumer pong = watchdog::pong;
             while (!stopped) {
-                int count = connected.webSocket == null ? input.read(buffer) : connected.webSocket.receive(buffer);
+                int count = connected.webSocket == null ? input.read(buffer) : connected.webSocket.receive(buffer, pong);
                 if (count == -1) {
                     return;
                 }
+                watchdog.received();
                 byte[] clear = relay.receiving().update(buffer, 0, count);
                 output.write(hello.outgoing().update(clear));
                 if (session.receivedReply()) {
@@ -225,6 +242,18 @@ final class ProxyEngine implements Closeable {
             recordUnanswered(session, dc, connected);
             quietlyClose(session);
         }
+    }
+
+    private void recoverStalledSession(Session session, Routes.Dc dc, Connected connected, long since) {
+        synchronized (session) {
+            if (session.isClosed()) {
+                return;
+            }
+            session.routes.failed(dc, connected.target, since, System.nanoTime(), config.communityAuto());
+            traffic.record(session.probe, ProxyTraffic.Event.STALL);
+            session.close();
+        }
+        log.accept(dc.label() + " · " + connected.target.label() + " · зависшее соединение закрыто");
     }
 
     private boolean recordUnanswered(Session session, Routes.Dc dc, Connected connected) {
@@ -571,6 +600,7 @@ final class ProxyEngine implements Closeable {
         final long started = System.nanoTime();
         private final List<Socket> upstreams = new ArrayList<>();
         private ScheduledFuture<?> replyDeadline;
+        private RelayWatchdog watchdog;
         private boolean forwarded;
         private boolean replied;
         private boolean failureRecorded;
@@ -584,6 +614,15 @@ final class ProxyEngine implements Closeable {
 
         synchronized boolean isClosed() {
             return closed;
+        }
+
+        synchronized boolean watch(RelayWatchdog next) {
+            if (closed) {
+                next.close();
+                return false;
+            }
+            watchdog = next;
+            return true;
         }
 
         synchronized boolean watchReply(ScheduledThreadPoolExecutor deadlines, Runnable timeout) {
@@ -646,6 +685,9 @@ final class ProxyEngine implements Closeable {
             }
             closed = true;
             cancelDeadline();
+            if (watchdog != null) {
+                watchdog.close();
+            }
             quietlyClose(client);
             upstreams.forEach(ProxyEngine::quietlyClose);
             upstreams.clear();

@@ -8,6 +8,7 @@ import java.io.DataOutputStream;
 import java.io.EOFException;
 import java.io.IOException;
 import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -21,6 +22,7 @@ import java.util.List;
 import java.util.HashMap;
 import java.util.Locale;
 import java.util.Map;
+import java.util.function.LongConsumer;
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLPeerUnverifiedException;
@@ -174,6 +176,10 @@ final class WebSocketWire {
         writeFrame(2, content);
     }
 
+    void ping(long token) throws IOException {
+        writeFrame(9, ByteBuffer.allocate(Long.BYTES).putLong(token).array());
+    }
+
     private synchronized void writeFrame(int opcode, byte[] content) throws IOException {
         int length = content.length;
         output.writeByte(0x80 | opcode);
@@ -197,6 +203,10 @@ final class WebSocketWire {
     }
 
     int receive(byte[] buffer) throws IOException {
+        return receive(buffer, null);
+    }
+
+    int receive(byte[] buffer, LongConsumer pong) throws IOException {
         while (remaining == 0) {
             int first = input.read();
             if (first < 0) {
@@ -235,7 +245,12 @@ final class WebSocketWire {
                     return -1;
                 }
                 case 9 -> writeFrame(10, MtProto.readExact(input, (int) size));
-                case 10 -> MtProto.readExact(input, (int) size);
+                case 10 -> {
+                    byte[] payload = MtProto.readExact(input, (int) size);
+                    if (pong != null && payload.length == Long.BYTES) {
+                        pong.accept(ByteBuffer.wrap(payload).getLong());
+                    }
+                }
                 default -> throw new IOException("Неизвестный кадр WebSocket");
             }
         }

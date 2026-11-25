@@ -89,6 +89,8 @@ final class NetworkDiagnostics {
             .append("\nПубличные домены в диагностике: ").append(includeCommunity)
             .append("\nНа каждое имя проверяется первый полученный адрес каждого семейства.\n")
             .append("MTProto OK означает проверенный ответ на служебный запрос без входа в аккаунт.\n");
+        ProxyTraffic traffic = ProxyStatus.traffic();
+        long networkChanges = traffic.networkChanges();
         header.append("\nПрокси до сетевых проверок\n");
         ProxyStatus.appendTraffic(header);
         if (network == null) {
@@ -125,9 +127,10 @@ final class NetworkDiagnostics {
         header.append("\nПрокси после сетевых проверок\n");
         ProxyStatus.appendTraffic(header);
         Network endNetwork = manager.getActiveNetwork();
+        boolean networkChanged = !Objects.equals(network, endNetwork) || traffic.networkChanges() != networkChanges;
         header.append("\nСеть при завершении: ").append(networkSummary(manager, endNetwork))
-            .append("\nСмена сети во время теста: ").append(!Objects.equals(network, endNetwork));
-        if (!Objects.equals(network, endNetwork)) {
+            .append("\nИзменения сети, замеченные приложением во время теста: ").append(networkChanged);
+        if (networkChanged) {
             header.append("\nДля сравнения запустите тест снова на одной сети.");
         }
         return DiagnosticReport.save(context, header.append('\n').toString());

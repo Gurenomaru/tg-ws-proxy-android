@@ -1,5 +1,6 @@
 package app.telegramws.proxy;
 
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 final class ProxyTraffic {
@@ -11,12 +12,14 @@ final class ProxyTraffic {
         NO_ROUTE("Нет маршрута"),
         REQUEST("Начата передача первого запроса"),
         REPLY("Первый ответ передан клиенту"),
-        NO_REPLY("Соединения без первого ответа");
+        NO_REPLY("Соединения без первого ответа"),
+        STALL("Закрыты после зависания действующего соединения");
 
         final String label;
         Event(String label) { this.label = label; }
     }
 
+    private final AtomicLong networkChanges = new AtomicLong();
     private final AtomicLongArray regular = new AtomicLongArray(Event.values().length);
     private final AtomicLongArray diagnostics = new AtomicLongArray(Event.values().length);
 
@@ -28,7 +31,16 @@ final class ProxyTraffic {
         return (probe ? diagnostics : regular).get(event.ordinal());
     }
 
+    void recordNetworkChange() {
+        networkChanges.incrementAndGet();
+    }
+
+    long networkChanges() {
+        return networkChanges.get();
+    }
+
     void appendTo(StringBuilder report) {
+        report.append("Сетевых переподключений с запуска: ").append(networkChanges()).append('\n');
         report.append("События прокси с запуска, обычные / служебные\n");
         for (Event event : Event.values()) {
             report.append(event.label).append(": ").append(count(false, event))

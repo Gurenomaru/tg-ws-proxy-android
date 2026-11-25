@@ -13,12 +13,14 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.Random;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.Test;
 
 public final class WebSocketWireTest {
@@ -55,6 +57,36 @@ public final class WebSocketWireTest {
             assertEquals(1, wire.receive(buffer));
             assertEquals(20, buffer[0]);
             assertEquals(-1, wire.receive(buffer));
+            remote.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    public void matchesPongPayloadWithoutForwardingItToMtproto() throws Exception {
+        try (ServerSocket server = new ServerSocket(0); Socket client = new Socket("127.0.0.1", server.getLocalPort());
+             Socket peer = server.accept()) {
+            client.setSoTimeout(2000);
+            peer.setSoTimeout(2000);
+            long token = 912;
+            FutureTask<Void> remote = new FutureTask<>(() -> {
+                upgrade(peer, true);
+                byte[] ping = readMasked(new DataInputStream(peer.getInputStream()), 0x89);
+                assertEquals(token, ByteBuffer.wrap(ping).getLong());
+                DataOutputStream output = new DataOutputStream(peer.getOutputStream());
+                output.writeByte(0x8a);
+                output.writeByte(ping.length);
+                output.write(ping);
+                output.write(new byte[]{(byte) 0x82, 1, 17});
+                return null;
+            });
+            new Thread(remote).start();
+            WebSocketWire wire = new WebSocketWire(client, TARGET);
+            wire.ping(token);
+            AtomicLong pong = new AtomicLong();
+            byte[] buffer = new byte[10];
+            assertEquals(1, wire.receive(buffer, pong::set));
+            assertEquals(token, pong.get());
+            assertEquals(17, buffer[0]);
             remote.get(3, TimeUnit.SECONDS);
         }
     }

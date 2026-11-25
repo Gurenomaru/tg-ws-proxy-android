@@ -174,6 +174,37 @@ public final class ProxyEngineTest {
         }
     }
 
+    @Test
+    public void closesAnEstablishedSocketThatStopsAnsweringAndAcceptsAReplacement() throws Exception {
+        try (ServerSocket relay = new ServerSocket(0)) {
+            var traffic = new ProxyTraffic();
+            var timing = new RelayWatchdog.Timing(80, 120, 700, 30);
+            try (ProxyEngine engine = start(relay, new CopyOnWriteArrayList<>(), traffic, false, timing)) {
+                var laterPayload = new CountDownLatch(1);
+                FutureTask<Void> blackhole = runPeer(relay, true, new CountDownLatch(0), laterPayload);
+                try (var client = new Socket("127.0.0.1", engine.port())) {
+                    client.setSoTimeout(2500);
+                    var hello = MtProto.initiate(MtProto.Mode.PADDED, (short) 2, SECRET);
+                    var request = ProxyProbe.request();
+                    client.getOutputStream().write(hello.header());
+                    client.getOutputStream().write(hello.sending().update(request.packet()));
+                    request.verify(MtProto.readPacket(client.getInputStream(), hello.receiving(), MtProto.Mode.PADDED));
+                    client.getOutputStream().write(hello.sending().update(ProxyProbe.request().packet()));
+                    assertTrue(laterPayload.await(2, TimeUnit.SECONDS));
+                    Thread.sleep(70);
+                    client.getOutputStream().write(hello.sending().update(ProxyProbe.request().packet()));
+                    assertEquals(-1, client.getInputStream().read());
+                }
+                blackhole.get(2, TimeUnit.SECONDS);
+                assertEquals(1, traffic.count(false, ProxyTraffic.Event.STALL));
+                assertEquals(0, traffic.count(false, ProxyTraffic.Event.NO_REPLY));
+                var replacement = runPeer(relay, true, new CountDownLatch(0));
+                assertTrue(ProxyProbe.check(engine.port(), SECRET, (short) 2) >= 0);
+                replacement.get(2, TimeUnit.SECONDS);
+            }
+        }
+    }
+
     private static ProxyEngine start(ServerSocket relay, List<String> journal) throws IOException {
         return start(relay, journal, new ProxyTraffic());
     }
@@ -184,10 +215,15 @@ public final class ProxyEngineTest {
 
     private static ProxyEngine start(ServerSocket relay, List<String> journal, ProxyTraffic traffic, boolean automatic)
         throws IOException {
+        return start(relay, journal, traffic, automatic, RelayWatchdog.DEFAULT);
+    }
+
+    private static ProxyEngine start(ServerSocket relay, List<String> journal, ProxyTraffic traffic, boolean automatic,
+                                     RelayWatchdog.Timing timing) throws IOException {
         relay.setSoTimeout(3000);
         Socks5.Endpoint socks = Socks5.parse("127.0.0.1:" + relay.getLocalPort(), "", "");
         Routes.Config config = new Routes.Config(0, "", Collections.emptyMap(), "", "", false, false, socks, true, false, automatic);
-        ProxyEngine engine = new ProxyEngine(config, SECRET, journal::add, traffic);
+        ProxyEngine engine = new ProxyEngine(config, SECRET, journal::add, traffic, timing);
         new Thread(() -> {
             try {
                 engine.serve();
@@ -199,6 +235,11 @@ public final class ProxyEngineTest {
     }
 
     private static FutureTask<Void> runPeer(ServerSocket listener, boolean respond, CountDownLatch received) {
+        return runPeer(listener, respond, received, null);
+    }
+
+    private static FutureTask<Void> runPeer(ServerSocket listener, boolean respond, CountDownLatch received,
+                                            CountDownLatch laterPayload) {
         FutureTask<Void> server = new FutureTask<>(() -> {
             try (Socket peer = listener.accept()) {
                 peer.setSoTimeout(9000);
@@ -215,6 +256,11 @@ public final class ProxyEngineTest {
                     byte[] reply = MtProto.little(new byte[44]).putInt(40).putLong(0).putLong(1).putInt(20)
                         .putInt(0x05162463).put(request, 28, 16).array();
                     output.write(init.outgoing().update(reply));
+                }
+                if (laterPayload != null) {
+                    MtProto.readPacket(input, init.incoming(), init.mode());
+                    laterPayload.countDown();
+                    MtProto.readPacket(input, init.incoming(), init.mode());
                 }
                 assertEquals(-1, input.read());
             }

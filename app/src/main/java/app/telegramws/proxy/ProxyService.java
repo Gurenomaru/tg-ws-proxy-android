@@ -7,13 +7,21 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
+import android.net.RouteInfo;
+import android.os.Build;
 import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import java.io.IOException;
 import java.net.BindException;
+import java.net.InetAddress;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -31,6 +39,9 @@ public final class ProxyService extends Service {
     private boolean watchingNetwork;
     private Network defaultNetwork;
     private Network reportedNetwork;
+    private NetworkPath networkPath;
+    private boolean networkValidated;
+    private boolean networkSuspended;
     private RouteHealth.Kind networkKind = RouteHealth.Kind.OTHER;
     private final ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
         @Override
@@ -44,8 +55,32 @@ public final class ProxyService extends Service {
                 return;
             }
             RouteHealth.Kind kind = kindOf(capabilities);
-            if (!network.equals(defaultNetwork) || kind != networkKind) {
+            boolean validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+            boolean suspended = isSuspended(capabilities);
+            boolean sameNetwork = network.equals(defaultNetwork);
+            boolean recovered = (validated && !networkValidated) || (!suspended && networkSuspended);
+            networkValidated = validated;
+            networkSuspended = suspended;
+            if (!sameNetwork) {
+                networkPath = null;
+            }
+            if (!sameNetwork || kind != networkKind) {
                 changeNetwork(network, kind, "Сеть сменилась · переподключение");
+            } else if (recovered) {
+                changeNetwork(network, kind, "Доступ к сети восстановился · переподключение");
+            }
+        }
+
+        @Override
+        public void onLinkPropertiesChanged(Network network, LinkProperties properties) {
+            if (!network.equals(defaultNetwork) || !network.equals(reportedNetwork)) {
+                return;
+            }
+            NetworkPath next = NetworkPath.from(properties);
+            boolean changed = networkPath != null && next.invalidates(networkPath);
+            networkPath = next;
+            if (changed) {
+                changeNetwork(network, networkKind, "Маршрут сети изменился · переподключение");
             }
         }
 
@@ -55,6 +90,9 @@ public final class ProxyService extends Service {
                 reportedNetwork = null;
             }
             if (network.equals(defaultNetwork)) {
+                networkPath = null;
+                networkValidated = false;
+                networkSuspended = false;
                 changeNetwork(null, RouteHealth.Kind.OTHER, "Сеть недоступна · соединения сброшены");
             }
         }
@@ -84,7 +122,12 @@ public final class ProxyService extends Service {
         ConnectivityManager connectivity = getSystemService(ConnectivityManager.class);
         defaultNetwork = connectivity.getActiveNetwork();
         reportedNetwork = defaultNetwork;
-        networkKind = defaultNetwork == null ? RouteHealth.Kind.OTHER : kindOf(connectivity.getNetworkCapabilities(defaultNetwork));
+        NetworkCapabilities initial = defaultNetwork == null ? null : connectivity.getNetworkCapabilities(defaultNetwork);
+        networkKind = kindOf(initial);
+        networkValidated = initial != null && initial.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
+        networkSuspended = isSuspended(initial);
+        LinkProperties properties = defaultNetwork == null ? null : connectivity.getLinkProperties(defaultNetwork);
+        networkPath = properties == null ? null : NetworkPath.from(properties);
         connectivity.registerDefaultNetworkCallback(networkCallback, main);
         watchingNetwork = true;
         ProxyTraffic traffic = ProxyStatus.traffic();
@@ -129,9 +172,28 @@ public final class ProxyService extends Service {
             defaultNetwork = network;
             networkKind = kind;
             if (!destroyed && engine != null) {
+                ProxyStatus.traffic().recordNetworkChange();
                 ProxyStatus.log(reason);
                 engine.networkChanged(kind);
             }
+        }
+    }
+
+    private static boolean isSuspended(NetworkCapabilities capabilities) {
+        return Build.VERSION.SDK_INT >= 28 && capabilities != null
+            && !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_SUSPENDED);
+    }
+
+    record NetworkPath(String interfaceName, Set<InetAddress> addresses, Set<RouteInfo> defaultRoutes) {
+        static NetworkPath from(LinkProperties links) {
+            return new NetworkPath(links.getInterfaceName(),
+                links.getLinkAddresses().stream().map(LinkAddress::getAddress).collect(Collectors.toSet()),
+                links.getRoutes().stream().filter(RouteInfo::isDefaultRoute).collect(Collectors.toSet()));
+        }
+
+        boolean invalidates(NetworkPath prior) {
+            return !Objects.equals(interfaceName, prior.interfaceName)
+                || !addresses.containsAll(prior.addresses) || !defaultRoutes.containsAll(prior.defaultRoutes);
         }
     }
 
