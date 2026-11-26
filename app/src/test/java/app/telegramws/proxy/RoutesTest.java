@@ -50,20 +50,6 @@ public final class RoutesTest {
         assertEquals(443, secure.get(1).targets().get(0).port());
     }
     @Test
-    public void automaticFallbackUsesPlainOnlyAfterDirectAndSecureThenReusesWorkingRoute() {
-        Routes.Config auto = new Routes.Config(1443, "", Collections.emptyMap(),
-            "", "", false, true, null, false, false, true);
-        var dc = Routes.Dc.fromWire((short) 2);
-        var fresh = Routes.ordered(dc, auto, RouteHealth.Kind.WIFI, null);
-        assertEquals("WSS Telegram IPv6", fresh.get(0).targets().get(0).label());
-        assertEquals(443, fresh.get(2).targets().get(0).port());
-        var relay = fresh.get(3).targets().get(0);
-        assertEquals(80, relay.port());
-        var remembered = Routes.ordered(dc, auto, RouteHealth.Kind.WIFI, relay);
-        assertEquals(Collections.singletonList(relay), remembered.get(0).targets());
-        assertEquals(1, remembered.stream().flatMap(stage -> stage.targets().stream()).filter(relay::equals).count());
-    }
-    @Test
     public void automaticMobileStartsWithTheSameRoutesAsManualMobileMode() {
         Routes.Config auto = new Routes.Config(1443, "", Collections.emptyMap(),
             "", "", false, true, null, false, false, true);
@@ -71,12 +57,10 @@ public final class RoutesTest {
             "", "", false, true, null, false, true, false);
         for (short dcId : new short[]{2, -2, -4, 203}) {
             var dc = Routes.Dc.fromWire(dcId);
-            var direct = Routes.candidates(dc, auto).get(0).targets().get(0);
             var manualFirst = Routes.candidates(dc, manual).get(0);
-            var automatic = Routes.ordered(dc, auto, RouteHealth.Kind.CELLULAR, direct);
+            var automatic = Routes.ordered(dc, auto, Routes.NetworkKind.CELLULAR);
             assertEquals(manualFirst, automatic.get(0));
             assertEquals(80, automatic.get(0).targets().get(0).port());
-            assertTrue(automatic.get(1).targets().contains(direct));
             assertEquals(1, automatic.stream().filter(stage -> stage.equals(manualFirst)).count());
         }
     }
@@ -86,7 +70,7 @@ public final class RoutesTest {
         var auto = new Routes.Config(1443, "", Collections.emptyMap(),
             "own.example.org", "", true, true, null, false, false, true);
         var dc = Routes.Dc.fromWire((short) 2);
-        var groups = Routes.automaticGroups(dc, auto, RouteHealth.Kind.WIFI);
+        var groups = Routes.automaticGroups(dc, auto, Routes.NetworkKind.WIFI);
         assertEquals(2, groups.size());
         assertTrue(groups.get(0).stream().noneMatch(Routes.Stage::publicRelay));
         assertTrue(groups.get(0).stream().flatMap(stage -> stage.targets().stream())
@@ -100,7 +84,7 @@ public final class RoutesTest {
     public void automaticGroupsHonorAnExplicitFirstSocksRoute() {
         var config = new Routes.Config(1443, "", Collections.emptyMap(),
             "", "", false, true, Socks5.parse("127.0.0.1:1080", "", ""), true, false, true);
-        var groups = Routes.automaticGroups(Routes.Dc.fromWire((short) -2), config, RouteHealth.Kind.CELLULAR);
+        var groups = Routes.automaticGroups(Routes.Dc.fromWire((short) -2), config, Routes.NetworkKind.CELLULAR);
         assertEquals(1, groups.get(0).size());
         assertTrue(groups.get(0).get(0).targets().get(0).socks());
         assertEquals(80, groups.get(1).get(0).targets().get(0).port());
@@ -112,14 +96,14 @@ public final class RoutesTest {
         Routes.Config declined = new Routes.Config(1443, "", Collections.emptyMap(),
             "", "", false, true, null, false, false, false);
         assertEquals(Routes.candidates(dc, declined),
-            Routes.ordered(dc, declined, RouteHealth.Kind.CELLULAR, null));
+            Routes.ordered(dc, declined, Routes.NetworkKind.CELLULAR));
         Routes.Config configured = new Routes.Config(1443, "", Collections.emptyMap(),
             "", "worker.example.org", false, true, null, false, false, true);
         assertEquals(Routes.candidates(dc, configured),
-            Routes.ordered(dc, configured, RouteHealth.Kind.CELLULAR, null));
+            Routes.ordered(dc, configured, Routes.NetworkKind.CELLULAR));
         Routes.Config socksFirst = new Routes.Config(1443, "", Collections.emptyMap(),
             "", "", false, true, Socks5.parse("127.0.0.1:1080", "", ""), true, false, true);
-        var ordered = Routes.ordered(dc, socksFirst, RouteHealth.Kind.CELLULAR, null);
+        var ordered = Routes.ordered(dc, socksFirst, Routes.NetworkKind.CELLULAR);
         assertTrue(ordered.get(0).targets().get(0).socks());
         assertEquals(80, ordered.get(1).targets().get(0).port());
     }

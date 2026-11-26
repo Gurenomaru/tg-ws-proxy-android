@@ -44,14 +44,6 @@ final class ProxySettings {
         return values.getBoolean("communityAuto", true);
     }
 
-    boolean rustEnabled() {
-        return values.getBoolean("rustEngine", false);
-    }
-
-    void setRustEnabled(boolean enabled) {
-        values.edit().putBoolean("rustEngine", enabled).apply();
-    }
-
     int port() {
         return values.getInt("port", 1443);
     }

@@ -21,7 +21,6 @@ final class ProxyTraffic {
 
     private final AtomicLong networkChanges = new AtomicLong();
     private volatile boolean restored;
-    private volatile String engine = "Java";
     private final AtomicLongArray regular = new AtomicLongArray(Event.values().length);
     private final AtomicLongArray diagnostics = new AtomicLongArray(Event.values().length);
 
@@ -31,10 +30,6 @@ final class ProxyTraffic {
 
     long count(boolean probe, Event event) {
         return (probe ? diagnostics : regular).get(event.ordinal());
-    }
-
-    void setEngine(String name) {
-        engine = name;
     }
 
     void setRestored(boolean restored) {
@@ -50,7 +45,7 @@ final class ProxyTraffic {
     }
 
     void appendTo(StringBuilder report) {
-        report.append("Движок прокси: ").append(engine).append('\n');
+        report.append("Движок прокси: Rust").append('\n');
         report.append("Сервис восстановлен Android: ").append(restored).append('\n');
         report.append("Сетевых переподключений с запуска: ").append(networkChanges()).append('\n');
         report.append("События прокси с запуска, обычные / служебные\n");

@@ -56,14 +56,29 @@ pub struct Socks {
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     pub automatic: bool,
+    pub targets: Vec<Target>,
     pub routes: HashMap<i16, Vec<Vec<Stage>>>,
+    #[serde(default)]
     pub mobile_routes: HashMap<i16, Vec<Vec<Stage>>>,
     pub socks: Option<Socks>,
 }
 
 impl Config {
+    pub fn valid(&self) -> bool {
+        self.routes
+            .values()
+            .chain(self.mobile_routes.values())
+            .flatten()
+            .flatten()
+            .all(|stage| stage.targets.iter().all(|&id| id < self.targets.len()))
+    }
+
+    pub fn target(&self, id: TargetId) -> &Target {
+        &self.targets[id]
+    }
+
     pub fn groups(&self, dc: Dc, cellular: bool) -> &[Vec<Stage>] {
-        let routes = if cellular {
+        let routes = if cellular && self.automatic {
             &self.mobile_routes
         } else {
             &self.routes
@@ -80,7 +95,9 @@ pub enum Family {
     Ipv6,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Hash)]
+pub type TargetId = usize;
+
+#[derive(Deserialize)]
 pub struct Target {
     pub host: String,
     pub address: String,
@@ -107,7 +124,7 @@ impl Target {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stage {
-    pub targets: Vec<Target>,
+    pub targets: Vec<TargetId>,
     pub limit: usize,
     pub public_relay: bool,
 }
@@ -117,46 +134,44 @@ pub struct Health(Mutex<History>);
 
 #[derive(Default)]
 struct History {
-    preferred: HashMap<Dc, (Target, Instant)>,
-    failed: HashMap<(Dc, Target), (u32, Instant)>,
+    preferred: HashMap<Dc, (TargetId, Instant)>,
+    failed: HashMap<(Dc, TargetId), (u32, Instant)>,
     last_no_route: HashMap<Dc, Instant>,
-    ranking: HashMap<(Dc, usize), (Vec<Target>, Instant)>,
+    ranking: HashMap<(Dc, usize), (Vec<TargetId>, Instant)>,
     measurements: HashMap<(Dc, usize), Arc<tokio::sync::Mutex<()>>>,
     rotation: usize,
 }
 
 impl Health {
-    pub fn preferred(&self, dc: Dc) -> Option<Target> {
+    pub fn preferred(&self, dc: Dc) -> Option<TargetId> {
         self.0
             .lock()
             .unwrap()
             .preferred
             .get(&dc)
             .filter(|(_, when)| when.elapsed() < Duration::from_secs(300))
-            .map(|(target, _)| target.clone())
+            .map(|(target, _)| *target)
     }
 
-    pub fn ready(&self, dc: Dc, target: &Target) -> bool {
+    pub fn ready(&self, dc: Dc, target: TargetId) -> bool {
         self.0
             .lock()
             .unwrap()
             .failed
-            .get(&(dc, target.clone()))
+            .get(&(dc, target))
             .is_none_or(|(_, retry)| Instant::now() >= *retry)
     }
 
-    pub fn succeeded(&self, dc: Dc, target: &Target) {
+    pub fn succeeded(&self, dc: Dc, target: TargetId) {
         let mut history = self.0.lock().unwrap();
-        history.failed.remove(&(dc, target.clone()));
-        history
-            .preferred
-            .insert(dc, (target.clone(), Instant::now()));
+        history.failed.remove(&(dc, target));
+        history.preferred.insert(dc, (target, Instant::now()));
     }
 
-    pub fn failed(&self, dc: Dc, target: &Target, started: Instant, automatic: bool) {
+    pub fn failed(&self, dc: Dc, target: TargetId, started: Instant, automatic: bool) {
         let mut history = self.0.lock().unwrap();
         if let Some((preferred, observed)) = history.preferred.get(&dc) {
-            if preferred == target {
+            if *preferred == target {
                 if *observed > started {
                     return;
                 }
@@ -164,7 +179,7 @@ impl Health {
             }
         }
         let now = Instant::now();
-        let key = (dc, target.clone());
+        let key = (dc, target);
         let count = match history.failed.get(&key) {
             Some(&(count, retry))
                 if now.saturating_duration_since(retry) <= Duration::from_secs(120) =>
@@ -200,7 +215,7 @@ impl Health {
         true
     }
 
-    pub fn rotate(&self, targets: &mut [Target], limit: usize) {
+    pub fn rotate(&self, targets: &mut [TargetId], limit: usize) {
         if !targets.is_empty() && targets.len() > limit {
             let mut history = self.0.lock().unwrap();
             targets.rotate_left(history.rotation % targets.len());
@@ -208,7 +223,7 @@ impl Health {
         }
     }
 
-    pub fn cached(&self, dc: Dc, group: usize) -> Option<Vec<Target>> {
+    pub fn cached(&self, dc: Dc, group: usize) -> Option<Vec<TargetId>> {
         self.0
             .lock()
             .unwrap()
@@ -218,7 +233,7 @@ impl Health {
             .map(|(targets, _)| targets.clone())
     }
 
-    pub fn remember(&self, dc: Dc, group: usize, targets: Vec<Target>) {
+    pub fn remember(&self, dc: Dc, group: usize, targets: Vec<TargetId>) {
         let ttl = Duration::from_secs(if targets.is_empty() { 30 } else { 300 });
         self.0
             .lock()
@@ -244,12 +259,33 @@ mod tests {
 
     #[test]
     fn uses_the_separate_wire_dc_and_cellular_plan() {
-        let config: Config = serde_json::from_str(r#"{"automatic":true,"routes":{"-203":[]},"mobileRoutes":{"-203":[[{"targets":[],"limit":4,"publicRelay":true}]]}}"#).unwrap();
+        let config: Config = serde_json::from_str(r#"{"automatic":true,"targets":[],"routes":{"-203":[]},"mobileRoutes":{"-203":[[{"targets":[],"limit":4,"publicRelay":true}]]}}"#).unwrap();
         let dc = Dc::decode(-203);
         assert_eq!(dc.relay_id(), -203);
         assert!(config.groups(dc, false).is_empty());
         assert!(config.groups(dc, true)[0][0].public_relay);
         assert!(config.groups(Dc::decode(203), true).is_empty());
         assert_eq!(Dc::decode(-10002).relay_id(), -2);
+        assert!(config.valid());
+    }
+
+    #[test]
+    fn rejects_unknown_target_ids_before_starting() {
+        let config: Config = serde_json::from_str(r#"{"automatic":false,"targets":[],"routes":{"2":[[{"targets":[1],"limit":1,"publicRelay":false}]]}}"#).unwrap();
+        assert!(!config.valid());
+    }
+
+    #[test]
+    fn a_stale_failure_does_not_invalidate_a_later_verified_reply() {
+        let health = Health::default();
+        let dc = Dc::decode(2);
+        let before_reply = Instant::now() - Duration::from_millis(1);
+        health.succeeded(dc, 3);
+        health.failed(dc, 3, before_reply, true);
+        assert_eq!(health.preferred(dc), Some(3));
+        assert!(health.ready(dc, 3));
+        health.failed(dc, 3, Instant::now(), true);
+        assert_eq!(health.preferred(dc), None);
+        assert!(!health.ready(dc, 3));
     }
 }

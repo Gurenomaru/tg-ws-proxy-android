@@ -1,4 +1,5 @@
 use crate::engine::{Engine, Event, Observer};
+use crate::routes::Config;
 use jni::objects::{GlobalRef, JByteArray, JClass, JObject, JString, JValue};
 use jni::sys::{jboolean, jint, jlong};
 use jni::{JNIEnv, JavaVM};
@@ -89,8 +90,14 @@ pub extern "system" fn Java_app_telegramws_proxy_RustProxyEngine_nativeBind(
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "Неверный порт"))?;
         let secret = read_secret(&mut env, &secret)?;
         let json: String = env.get_string(&config).map_err(jni_error)?.into();
-        let config = serde_json::from_str(&json)
+        let config: Config = serde_json::from_str(&json)
             .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "Неверные настройки маршрутов"))?;
+        if !config.valid() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "Неизвестный маршрут",
+            ));
+        }
         let target = LogTarget {
             vm: env.get_java_vm().map_err(jni_error)?,
             receiver: env.new_global_ref(&logger).map_err(jni_error)?,

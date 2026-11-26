@@ -33,7 +33,7 @@ public final class ProxyService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Object lock = new Object();
-    private ProxyRuntime engine;
+    private RustProxyEngine engine;
     private volatile boolean destroyed;
     private boolean started;
     private boolean watchingNetwork;
@@ -42,7 +42,7 @@ public final class ProxyService extends Service {
     private NetworkPath networkPath;
     private boolean networkValidated;
     private boolean networkSuspended;
-    private RouteHealth.Kind networkKind = RouteHealth.Kind.OTHER;
+    private Routes.NetworkKind networkKind = Routes.NetworkKind.OTHER;
     private final ConnectivityManager.NetworkCallback networkCallback = new ConnectivityManager.NetworkCallback() {
         @Override
         public void onAvailable(Network network) {
@@ -54,7 +54,7 @@ public final class ProxyService extends Service {
             if (!network.equals(reportedNetwork)) {
                 return;
             }
-            RouteHealth.Kind kind = kindOf(capabilities);
+            Routes.NetworkKind kind = kindOf(capabilities);
             boolean validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED);
             boolean suspended = isSuspended(capabilities);
             boolean sameNetwork = network.equals(defaultNetwork);
@@ -93,7 +93,7 @@ public final class ProxyService extends Service {
                 networkPath = null;
                 networkValidated = false;
                 networkSuspended = false;
-                changeNetwork(null, RouteHealth.Kind.OTHER, "Сеть недоступна · соединения сброшены");
+                changeNetwork(null, Routes.NetworkKind.OTHER, "Сеть недоступна · соединения сброшены");
             }
         }
     };
@@ -116,9 +116,7 @@ public final class ProxyService extends Service {
             return START_STICKY;
         }
         started = true;
-        ProxySettings settings = new ProxySettings(this);
-        Routes.Config config = settings.load();
-        boolean rust = settings.rustEnabled();
+        Routes.Config config = new ProxySettings(this).load();
         ProxyStatus.phase(ProxyStatus.Phase.STARTING, 0, "");
         boolean restored = intent == null;
         ProxyStatus.traffic().setRestored(restored);
@@ -138,30 +136,12 @@ public final class ProxyService extends Service {
         connectivity.registerDefaultNetworkCallback(networkCallback, main);
         watchingNetwork = true;
         ProxyTraffic traffic = ProxyStatus.traffic();
-        executor.execute(() -> run(config, traffic, rust));
+        executor.execute(() -> run(config, traffic));
         return START_STICKY;
     }
 
-    private ProxyRuntime createEngine(Routes.Config config, ProxyTraffic traffic, boolean rust) throws IOException {
-        byte[] key = ProxySettings.key(config.secret());
-        if (rust) {
-            try {
-                var engine = new RustProxyEngine(config, key, traffic);
-                traffic.setEngine("Rust");
-                return engine;
-            } catch (LinkageError unavailable) {
-                ProxyStatus.log("Движок Rust недоступен · запущен Java");
-            } catch (BindException addressInUse) {
-                throw addressInUse;
-            } catch (IOException failure) {
-                ProxyStatus.log("Движок Rust не запустился · запущен Java");
-            }
-        }
-        return new ProxyEngine(config, key, ProxyStatus::log, traffic);
-    }
-
-    private void run(Routes.Config config, ProxyTraffic traffic, boolean rust) {
-        try (ProxyRuntime created = createEngine(config, traffic, rust)) {
+    private void run(Routes.Config config, ProxyTraffic traffic) {
+        try (var created = new RustProxyEngine(config, ProxySettings.key(config.secret()), traffic)) {
             synchronized (lock) {
                 if (destroyed) {
                     return;
@@ -179,10 +159,11 @@ public final class ProxyService extends Service {
                 }
             });
             created.serve();
-        } catch (IOException e) {
+        } catch (IOException | LinkageError e) {
             main.post(() -> {
                 if (!destroyed) {
                     String reason = e instanceof BindException ? "Порт " + config.port() + " занят."
+                        : e instanceof LinkageError ? "Не удалось загрузить сетевое ядро"
                         : "Ошибка локального сервера";
                     ProxyStatus.log(reason);
                     ProxyStatus.phase(ProxyStatus.Phase.FAILED, 0, reason);
@@ -192,7 +173,7 @@ public final class ProxyService extends Service {
         }
     }
 
-    private void changeNetwork(Network network, RouteHealth.Kind kind, String reason) {
+    private void changeNetwork(Network network, Routes.NetworkKind kind, String reason) {
         synchronized (lock) {
             defaultNetwork = network;
             networkKind = kind;
@@ -222,17 +203,17 @@ public final class ProxyService extends Service {
         }
     }
 
-    private static RouteHealth.Kind kindOf(NetworkCapabilities capabilities) {
+    private static Routes.NetworkKind kindOf(NetworkCapabilities capabilities) {
         if (capabilities == null || capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-            return RouteHealth.Kind.OTHER;
+            return Routes.NetworkKind.OTHER;
         }
         if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-            return RouteHealth.Kind.WIFI;
+            return Routes.NetworkKind.WIFI;
         }
         if (capabilities.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
-            return RouteHealth.Kind.CELLULAR;
+            return Routes.NetworkKind.CELLULAR;
         }
-        return RouteHealth.Kind.OTHER;
+        return Routes.NetworkKind.OTHER;
     }
 
     private Notification notification(String title, String detail) {

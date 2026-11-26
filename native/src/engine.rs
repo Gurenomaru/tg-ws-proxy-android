@@ -1,5 +1,6 @@
+use crate::liveness::Liveness;
 use crate::protocol::{self, ClientHello, RelayHello, HELLO_SIZE};
-use crate::routes::{Config, Dc, Family, Health, Stage, Target};
+use crate::routes::{Config, Dc, Family, Health, Stage, Target, TargetId};
 use crate::wire::{self, Frame, Frames};
 use ctr::cipher::StreamCipher;
 use socket2::{SockRef, TcpKeepalive};
@@ -12,7 +13,7 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use tokio::io::{self as async_io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{lookup_host, TcpListener, TcpStream};
-use tokio::sync::{oneshot, watch, Mutex as AsyncMutex, Notify, Semaphore};
+use tokio::sync::{oneshot, watch, Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout};
 
@@ -27,7 +28,8 @@ const PRIVATE_SCAN_TIMEOUT: Duration = Duration::from_millis(1600);
 const PUBLIC_SCAN_TIMEOUT: Duration = Duration::from_millis(2500);
 const COMPARISON_WINDOW: Duration = Duration::from_millis(180);
 const FIRST_REPLY_TIMEOUT: Duration = Duration::from_secs(6);
-const TRANSFER_BUFFER: usize = 32 * 1024;
+const INITIAL_BUFFER: usize = 8 * 1024;
+const MAX_TRANSFER_BUFFER: usize = 32 * 1024;
 const SENT: u8 = 1;
 const REPLIED: u8 = 2;
 
@@ -123,13 +125,14 @@ impl Engine {
                 _ = sessions.join_next(), if !sessions.is_empty() => {},
                 result = listener.accept() => {
                     let (socket, peer) = result?;
+                    let mut cancellation = signal.clone();
+                    let Some(network) = cancellation.borrow_and_update().clone() else { continue };
                     let probe = self.observer.is_probe(peer.port());
                     self.observer.record(probe, Event::Opened);
                     let Ok(slot) = slots.clone().try_acquire_owned() else {
                         self.observer.record(probe, Event::Limit);
                         continue
                     };
-                    let cancellation = self.signal.subscribe();
                     let ctx = SessionContext {
                         config: self.config.clone(), dialing: dialing.clone(),
                         measurements: measurements.clone(), observer: self.observer.clone(),
@@ -137,7 +140,7 @@ impl Engine {
                     };
                     sessions.spawn(async move {
                         let _slot = slot;
-                        run_session(socket, ctx, cancellation).await;
+                        run_session(socket, ctx, network, cancellation).await;
                     });
                 }
             }
@@ -157,10 +160,9 @@ struct SessionContext {
 async fn run_session(
     mut socket: TcpStream,
     ctx: SessionContext,
+    network: Arc<NetworkState>,
     mut cancellation: watch::Receiver<Option<Arc<NetworkState>>>,
 ) {
-    let network = cancellation.borrow_and_update().clone();
-    let Some(network) = network else { return };
     let health = &network.health;
     let run = async {
         let started = Instant::now();
@@ -181,10 +183,11 @@ async fn run_session(
             }
             return Ok::<(), io::Error>(());
         };
+        let route = ctx.config.target(target);
         ctx.observer.log(&format!(
             "{} · {} · выбор {} мс",
             dc.label(),
-            target.description(),
+            route.description(),
             selecting.elapsed().as_millis()
         ));
 
@@ -193,11 +196,10 @@ async fn run_session(
         let reply = Reply {
             state: &state,
             health,
-            target: &target,
+            target,
             ctx: &ctx,
             dc,
-            progress: Mutex::new(Progress::default()),
-            activity: Notify::new(),
+            liveness: Liveness::default(),
         };
         let result = match upstream {
             Upstream::Tcp(stream) => relay_tcp(socket, stream, hello, relay, &reply).await,
@@ -207,7 +209,7 @@ async fn run_session(
         };
         if state.load(Ordering::Relaxed) == SENT {
             ctx.record(Event::NoReply);
-            health.failed(dc, &target, started, ctx.config.automatic);
+            health.failed(dc, target, started, ctx.config.automatic);
             if result
                 .as_ref()
                 .is_err_and(|error| error.kind() == ErrorKind::TimedOut)
@@ -215,30 +217,28 @@ async fn run_session(
                 ctx.observer.log(&format!(
                     "{} · {} · нет первого ответа",
                     dc.label(),
-                    target.label
+                    route.label
                 ));
             }
         } else if let Err(error) = result {
             if error.kind() == ErrorKind::TimedOut {
                 ctx.record(Event::Stall);
-                let since = reply.progress.lock().unwrap().since.unwrap_or(started);
-                health.failed(dc, &target, since, ctx.config.automatic);
+                let since = reply.liveness.started().unwrap_or(started);
+                health.failed(dc, target, since, ctx.config.automatic);
                 ctx.observer.log(&format!(
                     "{} · {} · зависшее соединение закрыто",
                     dc.label(),
-                    target.label
+                    route.label
                 ));
             } else if error.kind() == ErrorKind::InvalidData {
-                ctx.observer.log(&format!(
-                    "{} · {} · ошибка обмена",
-                    dc.label(),
-                    target.label
-                ));
+                ctx.observer
+                    .log(&format!("{} · {} · ошибка обмена", dc.label(), route.label));
             }
         }
         Ok(())
     };
     tokio::select! {
+        biased;
         _ = cancellation.changed() => {},
         _ = run => {},
     }
@@ -250,15 +250,15 @@ impl SessionContext {
     }
 }
 
-fn sample(group: &[Stage], dc: Dc, health: &Health) -> Vec<Target> {
+fn sample(group: &[Stage], dc: Dc, health: &Health) -> Vec<TargetId> {
     let preferred = health.preferred(dc);
     let mut choices = Vec::new();
     for stage in group {
         let mut available: Vec<_> = stage
             .targets
             .iter()
-            .filter(|target| health.ready(dc, target))
-            .cloned()
+            .copied()
+            .filter(|&target| health.ready(dc, target))
             .collect();
         health.rotate(&mut available, stage.limit);
         if let Some(position) = available
@@ -276,7 +276,7 @@ async fn select_route(
     ctx: &SessionContext,
     dc: Dc,
     network: &NetworkState,
-) -> Option<(Target, Upstream)> {
+) -> Option<(TargetId, Upstream)> {
     let groups = ctx.config.groups(dc, network.cellular);
     let health = &network.health;
     if !ctx.config.automatic {
@@ -285,10 +285,9 @@ async fn select_route(
             if let Some(result) = race(ctx, dc, health, &choices, DIAL_TIMEOUT).await {
                 return Some(result);
             }
-            if let Some(retry) = choices
-                .iter()
-                .find(|target| target.sni.is_some() && health.ready(dc, target))
-            {
+            if let Some(retry) = choices.iter().find(|&&target| {
+                ctx.config.target(target).sni.is_some() && health.ready(dc, target)
+            }) {
                 if let Some(result) =
                     race(ctx, dc, health, std::slice::from_ref(retry), DIAL_TIMEOUT).await
                 {
@@ -302,7 +301,7 @@ async fn select_route(
     timeout(AUTO_SELECT_TIMEOUT, async {
         if let Some(preferred) = health
             .preferred(dc)
-            .filter(|target| health.ready(dc, target))
+            .filter(|&target| health.ready(dc, target))
         {
             if let Some(result) = race(ctx, dc, health, &[preferred], LIVE_DIAL_TIMEOUT).await {
                 return Some(result);
@@ -310,7 +309,7 @@ async fn select_route(
         }
         for index in 0..groups.len() {
             if let Some(mut ranked) = health.cached(dc, index) {
-                ranked.retain(|target| health.ready(dc, target));
+                ranked.retain(|&target| health.ready(dc, target));
                 if let Some(result) = race(ctx, dc, health, &ranked, AUTO_DIAL_TIMEOUT).await {
                     return Some(result);
                 }
@@ -318,7 +317,7 @@ async fn select_route(
         }
         for (index, group) in groups.iter().enumerate() {
             let mut ranked = measured_routes(ctx, dc, group, index, health).await;
-            ranked.retain(|target| health.ready(dc, target));
+            ranked.retain(|&target| health.ready(dc, target));
             if let Some(result) = race(ctx, dc, health, &ranked, AUTO_DIAL_TIMEOUT).await {
                 return Some(result);
             }
@@ -349,11 +348,11 @@ async fn measured_routes(
     group: &[Stage],
     index: usize,
     health: &Health,
-) -> Vec<Target> {
+) -> Vec<TargetId> {
     let lock = health.measurement_lock(dc, index);
     let _measurement = lock.lock().await;
     if let Some(cached) = health.cached(dc, index) {
-        if cached.is_empty() || cached.iter().any(|target| health.ready(dc, target)) {
+        if cached.is_empty() || cached.iter().any(|&target| health.ready(dc, target)) {
             return cached;
         }
     }
@@ -369,7 +368,7 @@ async fn measured_routes(
         tasks.spawn(async move {
             let _permit = permits.acquire().await.ok()?;
             let started = Instant::now();
-            let upstream = dial(&target, &config).await.ok()?;
+            let upstream = dial(config.target(target), &config).await.ok()?;
             verify(upstream, dc.relay_id()).await.ok()?;
             Some((started.elapsed(), order, target))
         });
@@ -396,12 +395,12 @@ async fn race(
     ctx: &SessionContext,
     dc: Dc,
     health: &Health,
-    choices: &[Target],
+    choices: &[TargetId],
     dial_timeout: Duration,
-) -> Option<(Target, Upstream)> {
+) -> Option<(TargetId, Upstream)> {
     let mut attempts = JoinSet::new();
-    let label = choices.first()?.label.as_str();
-    for (index, target) in choices.iter().cloned().enumerate() {
+    let label = ctx.config.target(*choices.first()?).label.as_str();
+    for (index, target) in choices.iter().copied().enumerate() {
         let config = ctx.config.clone();
         let dialing = ctx.dialing.clone();
         attempts.spawn(async move {
@@ -414,7 +413,7 @@ async fn race(
                     .acquire()
                     .await
                     .map_err(|_| io::Error::new(ErrorKind::Interrupted, "Подключение отменено"))?;
-                dial(&target, &config).await
+                dial(config.target(target), &config).await
             })
             .await
             .unwrap_or_else(|_| Err(io::Error::new(ErrorKind::TimedOut, "тайм-аут")));
@@ -427,7 +426,7 @@ async fn race(
             match result {
                 Ok(connection) => return Some((target, connection)),
                 Err(error) => {
-                    health.failed(dc, &target, started, ctx.config.automatic);
+                    health.failed(dc, target, started, ctx.config.automatic);
                     let message = match error.kind() {
                         ErrorKind::TimedOut => "тайм-аут",
                         ErrorKind::ConnectionRefused => "подключение отклонено",
@@ -556,21 +555,13 @@ async fn connect(host: &str, port: u16, family: Family) -> io::Result<TcpStream>
     Ok(stream)
 }
 
-#[derive(Default)]
-struct Progress {
-    since: Option<Instant>,
-    last_sent: Option<Instant>,
-    retried: bool,
-}
-
 struct Reply<'a> {
     state: &'a AtomicU8,
     health: &'a Health,
-    target: &'a Target,
+    target: TargetId,
     ctx: &'a SessionContext,
     dc: Dc,
-    progress: Mutex<Progress>,
-    activity: Notify,
+    liveness: Liveness,
 }
 
 impl Reply<'_> {
@@ -581,18 +572,7 @@ impl Reply<'_> {
             let _ = sender.send(());
         }
         if self.state.load(Ordering::Relaxed) & REPLIED != 0 {
-            let now = Instant::now();
-            let mut progress = self.progress.lock().unwrap();
-            if progress.since.is_none() {
-                progress.since = Some(now);
-                self.activity.notify_one();
-            } else if progress
-                .last_sent
-                .is_some_and(|last| now - last >= Duration::from_secs(4))
-            {
-                progress.retried = true;
-            }
-            progress.last_sent = Some(now);
+            self.liveness.sent();
         }
     }
 
@@ -602,40 +582,30 @@ impl Reply<'_> {
             self.health.succeeded(self.dc, self.target);
             self.ctx.record(Event::Reply);
         }
-        let mut progress = self.progress.lock().unwrap();
-        if progress.since.is_some() {
-            *progress = Progress::default();
-            self.activity.notify_one();
-        }
+        self.liveness.received();
     }
 
-    async fn deadline(&self, first: oneshot::Receiver<()>) -> io::Result<()> {
+    async fn deadline<W>(
+        &self,
+        first: oneshot::Receiver<()>,
+        websocket: Option<&AsyncMutex<W>>,
+    ) -> io::Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         if first.await.is_ok() {
             sleep(FIRST_REPLY_TIMEOUT).await;
             if self.state.load(Ordering::Relaxed) & REPLIED == 0 {
                 return Err(io::Error::new(ErrorKind::TimedOut, "Нет первого ответа"));
             }
         }
-        loop {
-            let since = self.progress.lock().unwrap().since;
-            if let Some(since) = since {
-                let expires = tokio::time::Instant::from_std(since + Duration::from_secs(20));
-                tokio::select! {
-                    _ = tokio::time::sleep_until(expires) => {
-                        let mut progress = self.progress.lock().unwrap();
-                        if progress.since == Some(since) && progress.retried {
-                            return Err(io::Error::new(ErrorKind::TimedOut, "Зависшее соединение"));
-                        }
-                        if progress.since == Some(since) {
-                            *progress = Progress::default();
-                        }
-                    }
-                    _ = self.activity.notified() => {}
-                }
-            } else {
-                self.activity.notified().await;
-            }
-        }
+        self.liveness.watch(websocket).await
+    }
+}
+
+fn grow_buffer(buffer: &mut Vec<u8>, used: usize) {
+    if used == buffer.len() && used < MAX_TRANSFER_BUFFER {
+        buffer.resize(used * 2, 0);
     }
 }
 
@@ -652,7 +622,7 @@ async fn relay_tcp(
     let (first_sender, first_receiver) = oneshot::channel();
     let upload = async {
         let mut first = Some(first_sender);
-        let mut buffer = vec![0; TRANSFER_BUFFER];
+        let mut buffer = vec![0; INITIAL_BUFFER];
         loop {
             let len = local_read.read(&mut buffer).await?;
             if len == 0 {
@@ -665,10 +635,11 @@ async fn relay_tcp(
             hello.from_client.apply_keystream(data);
             relay.to_server.apply_keystream(data);
             remote_write.write_all(data).await?;
+            grow_buffer(&mut buffer, len);
         }
     };
     let download = async {
-        let mut buffer = vec![0; TRANSFER_BUFFER];
+        let mut buffer = vec![0; INITIAL_BUFFER];
         loop {
             let len = remote_read.read(&mut buffer).await?;
             if len == 0 {
@@ -679,12 +650,13 @@ async fn relay_tcp(
             hello.to_client.apply_keystream(data);
             local_write.write_all(data).await?;
             reply.received();
+            grow_buffer(&mut buffer, len);
         }
     };
     tokio::select! {
         result = upload => result,
         result = download => result,
-        result = reply.deadline(first_receiver) => result,
+        result = reply.deadline::<async_io::Sink>(first_receiver, None) => result,
     }
 }
 
@@ -720,7 +692,7 @@ where
         }
     };
     let download = async {
-        let mut buffer = vec![0; TRANSFER_BUFFER];
+        let mut buffer = vec![0; INITIAL_BUFFER];
         let mut frames = Frames::default();
         loop {
             match frames.read(&mut remote_read, &mut buffer).await? {
@@ -730,11 +702,13 @@ where
                     hello.to_client.apply_keystream(data);
                     local_write.write_all(data).await?;
                     reply.received();
+                    grow_buffer(&mut buffer, len);
                 }
                 Frame::Control(9, len) => {
                     wire::write_frame(&mut *remote_write.lock().await, 10, &mut buffer[..len])
                         .await?;
                 }
+                Frame::Control(10, len) => reply.liveness.pong(&buffer[..len]),
                 Frame::Control(8, len) => {
                     wire::write_frame(&mut *remote_write.lock().await, 8, &mut buffer[..len])
                         .await?;
@@ -748,6 +722,59 @@ where
     tokio::select! {
         result = upload => result,
         result = download => result,
-        result = reply.deadline(first_receiver) => result,
+        result = reply.deadline(first_receiver, Some(&remote_write)) => result,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Weak;
+
+    #[derive(Default)]
+    struct SwitchingObserver(Mutex<Weak<Engine>>);
+
+    impl Observer for SwitchingObserver {
+        fn log(&self, _line: &str) {}
+        fn is_probe(&self, _port: u16) -> bool {
+            false
+        }
+        fn record(&self, _probe: bool, event: Event) {
+            if matches!(event, Event::Opened) {
+                if let Some(engine) = self.0.lock().unwrap().upgrade() {
+                    engine.network_changed(true);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn closes_old_client_when_network_changes_during_accept() {
+        let observer = Arc::new(SwitchingObserver::default());
+        let config =
+            serde_json::from_str(r#"{"automatic":false,"targets":[],"routes":{}}"#).unwrap();
+        let engine = Arc::new(Engine::bind(0, [0; 16], config, observer.clone()).unwrap());
+        *observer.0.lock().unwrap() = Arc::downgrade(&engine);
+        let address = engine
+            .listener
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let server = engine.clone();
+        let running = tokio::spawn(async move { server.serve().await });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        let mut byte = [0; 1];
+        assert_eq!(
+            timeout(Duration::from_secs(1), client.read(&mut byte))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        engine.close();
+        running.await.unwrap().unwrap();
     }
 }

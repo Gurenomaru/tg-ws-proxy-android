@@ -39,6 +39,7 @@ final class Routes {
     }
 
     enum Family { SYSTEM, IPV4, IPV6 }
+    enum NetworkKind { CELLULAR, WIFI, OTHER }
 
     record Target(String host, String address, String path, String sni, String label, boolean socks,
                   int port, Family family) {
@@ -146,8 +147,8 @@ final class Routes {
         return stages;
     }
 
-    static List<List<Stage>> automaticGroups(Dc dc, Config config, RouteHealth.Kind kind) {
-        List<Stage> stages = ordered(dc, config, kind, null);
+    static List<List<Stage>> automaticGroups(Dc dc, Config config, NetworkKind kind) {
+        List<Stage> stages = ordered(dc, config, kind);
         List<List<Stage>> groups = new ArrayList<>();
         if (stages.isEmpty()) {
             return groups;
@@ -173,34 +174,11 @@ final class Routes {
         return groups;
     }
 
-    static List<Stage> ordered(Dc dc, Config config, RouteHealth.Kind kind, Target preferred) {
-        boolean automaticMobile = kind == RouteHealth.Kind.CELLULAR && config.communityAuto
+    static List<Stage> ordered(Dc dc, Config config, NetworkKind kind) {
+        boolean automaticMobile = kind == NetworkKind.CELLULAR && config.communityAuto
             && config.cloudflare.isEmpty() && config.worker.isEmpty();
         boolean plainFirst = !dc.test && (config.communityPlain || automaticMobile);
-        List<Stage> stages = candidates(dc, config, plainFirst);
-        if (!config.communityAuto || preferred == null) {
-            return stages;
-        }
-        int first = config.socks != null && config.socksFirst ? 1 : 0;
-        if (plainFirst) {
-            first++;
-        }
-        for (int i = first + 1; i < stages.size(); i++) {
-            Stage stage = stages.get(i);
-            if (!stage.targets.contains(preferred)) {
-                continue;
-            }
-            List<Target> rest = new ArrayList<>(stage.targets);
-            rest.remove(preferred);
-            if (rest.isEmpty()) {
-                stages.remove(i);
-            } else {
-                stages.set(i, new Stage(rest, Math.min(stage.attemptLimit, rest.size()), stage.publicRelay));
-            }
-            stages.add(first, new Stage(preferred));
-            break;
-        }
-        return stages;
+        return candidates(dc, config, plainFirst);
     }
 
     private static void addDnsRoutes(List<Target> targets, String host, String path) {
