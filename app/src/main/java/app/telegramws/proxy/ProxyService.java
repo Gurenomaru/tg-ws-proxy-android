@@ -28,7 +28,7 @@ import java.util.concurrent.Executors;
 public final class ProxyService extends Service {
     static final String START = "app.telegramws.proxy.START";
     static final String STOP = "app.telegramws.proxy.STOP";
-    private static final String CHANNEL = "proxy";
+    static final String CHANNEL = "proxy";
     private static final int NOTIFICATION = 1;
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
@@ -108,16 +108,21 @@ public final class ProxyService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int id) {
-        if (intent == null || STOP.equals(intent.getAction())) {
+        if (intent != null && STOP.equals(intent.getAction())) {
             stopSelf();
             return START_NOT_STICKY;
         }
         if (started) {
-            return START_NOT_STICKY;
+            return START_STICKY;
         }
         started = true;
         Routes.Config config = new ProxySettings(this).load();
         ProxyStatus.phase(ProxyStatus.Phase.STARTING, 0, "");
+        boolean restored = intent == null;
+        ProxyStatus.traffic().setRestored(restored);
+        if (restored) {
+            ProxyStatus.log("Android восстановил фоновый сервис");
+        }
         startForeground(NOTIFICATION, notification(getString(R.string.notification_starting), ""));
         ConnectivityManager connectivity = getSystemService(ConnectivityManager.class);
         defaultNetwork = connectivity.getActiveNetwork();
@@ -132,7 +137,7 @@ public final class ProxyService extends Service {
         watchingNetwork = true;
         ProxyTraffic traffic = ProxyStatus.traffic();
         executor.execute(() -> run(config, traffic));
-        return START_NOT_STICKY;
+        return START_STICKY;
     }
 
     private void run(Routes.Config config, ProxyTraffic traffic) {

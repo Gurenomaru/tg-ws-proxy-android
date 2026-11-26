@@ -1,6 +1,7 @@
 package app.telegramws.proxy;
 
 import android.Manifest;
+import android.annotation.SuppressLint;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.content.ActivityNotFoundException;
@@ -35,6 +36,7 @@ import java.util.concurrent.CompletableFuture;
 
 public final class MainActivity extends Activity {
     private static final int ALLOW_INSTALL = 14;
+    private static final int NOTIFICATION_PERMISSION = 1;
     private static final int BACKGROUND = Color.rgb(16, 25, 35);
     private static final int SURFACE = Color.rgb(24, 38, 50);
     private static final int BORDER = Color.rgb(53, 72, 86);
@@ -53,7 +55,9 @@ public final class MainActivity extends Activity {
     private ProxySettings settings;
     private TextView status, address, description, probeStatus;
     private Button toggle, connect, copy, probe, edit;
-    private Button diagnostics, shareReport, updateCheck;
+    private Button diagnostics, shareReport, updateCheck, background;
+    private BackgroundPolicy.Status backgroundStatus;
+    private boolean requestingNotifications;
     private int handledUpdate;
     private boolean manualUpdate;
     private int announcedDiagnostics;
@@ -86,7 +90,7 @@ public final class MainActivity extends Activity {
         LinearLayout card = column();
         card.setPadding(dp(18), dp(18), dp(18), dp(18));
         card.setBackground(shape(SURFACE, BORDER, 22));
-        add(page, card, 18);
+        add(page, card, 8);
         status = sectionTitle("");
         add(card, status, 7);
         address = text("", 22, TEXT);
@@ -96,6 +100,8 @@ public final class MainActivity extends Activity {
         add(card, description, 14);
         toggle = button("Запустить прокси", true, v -> toggle());
         add(card, toggle, 0);
+        background = button("Работа в фоне", false, v -> offerBackground());
+        add(page, background, 18);
 
         add(page, sectionTitle("Подключение"), 3);
         add(page, text("Откройте настройки прокси в Telegram и подтвердите подключение.", 14, MUTED), 10);
@@ -131,12 +137,14 @@ public final class MainActivity extends Activity {
         add(page, edit, 7);
         updateCheck = button("Проверить обновления", false, v -> checkForUpdate());
         add(page, updateCheck, 0);
+        backgroundStatus = BackgroundPolicy.read(this);
         render();
     }
 
     @Override
     protected void onResume() {
         super.onResume();
+        backgroundStatus = BackgroundPolicy.read(this);
         ReleaseUpdates.check(this, false);
         ui.removeCallbacks(update);
         update.run();
@@ -173,8 +181,71 @@ public final class MainActivity extends Activity {
         edit.setEnabled(!online && !starting);
         probeStatus.setVisibility(view.probe().isEmpty() ? View.GONE : View.VISIBLE);
         probeStatus.setText(view.probe());
+        background.setText(backgroundStatus.needsSetup() ? "Настроить работу в фоне" : "Работа в фоне");
+        if (online && !requestingNotifications && hasWindowFocus() && backgroundStatus.needsSetup()
+            && !getPreferences(MODE_PRIVATE).getBoolean("backgroundOffered", false)) {
+            offerBackground();
+            return;
+        }
         renderDiagnostics();
         renderUpdate();
+    }
+
+    private void offerBackground() {
+        backgroundStatus = BackgroundPolicy.read(this);
+        getPreferences(MODE_PRIVATE).edit().putBoolean("backgroundOffered", true).apply();
+        String explanation;
+        if (backgroundStatus.restricted()) {
+            explanation = "Android ограничивает работу Telegram WS в фоне. В настройках приложения "
+                + "откройте раздел «Батарея» и разрешите фоновую работу.";
+        } else if (!backgroundStatus.exempt()) {
+            explanation = "Чтобы прокси сохранял доступ к сети при выключенном экране, "
+                + "разрешите Telegram WS работать без оптимизации батареи.";
+        } else {
+            explanation = "Telegram WS добавлен в исключения оптимизации батареи.";
+        }
+        if (!backgroundStatus.notifications()) {
+            explanation += "\n\nУведомления выключены. Их можно включить в настройках приложения, "
+                + "чтобы видеть статус прокси и останавливать его из шторки.";
+        }
+        var dialog = new AlertDialog.Builder(this).setTitle("Работа в фоне").setMessage(explanation);
+        if (backgroundStatus.restricted()) {
+            dialog.setPositiveButton("Настройки приложения", (window, which) -> openAppSettings())
+                .setNegativeButton("Позже", null);
+        } else if (!backgroundStatus.exempt()) {
+            dialog.setPositiveButton("Разрешить", (window, which) -> requestBackgroundExemption())
+                .setNeutralButton("Настройки приложения", (window, which) -> openAppSettings())
+                .setNegativeButton("Позже", null);
+        } else {
+            dialog.setPositiveButton("Готово", null)
+                .setNeutralButton("Настройки приложения", (window, which) -> openAppSettings());
+        }
+        dialog.show();
+    }
+
+    // The user-started proxy needs network access in Doze to relay another app's connections.
+    @SuppressLint("BatteryLife")
+    private void requestBackgroundExemption() {
+        Intent request = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+            Uri.fromParts("package", getPackageName(), null));
+        try {
+            startActivity(request);
+        } catch (ActivityNotFoundException | SecurityException unavailable) {
+            try {
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            } catch (ActivityNotFoundException | SecurityException ignored) {
+                openAppSettings();
+            }
+        }
+    }
+
+    private void openAppSettings() {
+        try {
+            startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                Uri.fromParts("package", getPackageName(), null)));
+        } catch (ActivityNotFoundException | SecurityException ignored) {
+            toast("Не удалось открыть настройки приложения");
+        }
     }
 
     private void checkForUpdate() {
@@ -369,9 +440,19 @@ public final class MainActivity extends Activity {
             != PackageManager.PERMISSION_GRANTED
             && !getPreferences(MODE_PRIVATE).getBoolean("notificationsAsked", false)) {
             getPreferences(MODE_PRIVATE).edit().putBoolean("notificationsAsked", true).apply();
-            requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, 1);
+            requestingNotifications = true;
+            requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, NOTIFICATION_PERMISSION);
         }
         updateAfterToggle();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(code, permissions, results);
+        if (code == NOTIFICATION_PERMISSION) {
+            requestingNotifications = false;
+            backgroundStatus = BackgroundPolicy.read(this);
+        }
     }
 
     private void updateAfterToggle() {

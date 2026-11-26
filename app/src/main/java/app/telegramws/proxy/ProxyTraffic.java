@@ -20,6 +20,7 @@ final class ProxyTraffic {
     }
 
     private final AtomicLong networkChanges = new AtomicLong();
+    private volatile boolean restored;
     private final AtomicLongArray regular = new AtomicLongArray(Event.values().length);
     private final AtomicLongArray diagnostics = new AtomicLongArray(Event.values().length);
 
@@ -31,6 +32,10 @@ final class ProxyTraffic {
         return (probe ? diagnostics : regular).get(event.ordinal());
     }
 
+    void setRestored(boolean restored) {
+        this.restored = restored;
+    }
+
     void recordNetworkChange() {
         networkChanges.incrementAndGet();
     }
@@ -40,6 +45,7 @@ final class ProxyTraffic {
     }
 
     void appendTo(StringBuilder report) {
+        report.append("Сервис восстановлен Android: ").append(restored).append('\n');
         report.append("Сетевых переподключений с запуска: ").append(networkChanges()).append('\n');
         report.append("События прокси с запуска, обычные / служебные\n");
         for (Event event : Event.values()) {

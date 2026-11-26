@@ -89,6 +89,7 @@ final class NetworkDiagnostics {
             .append("\nПубличные домены в диагностике: ").append(includeCommunity)
             .append("\nНа каждое имя проверяется первый полученный адрес каждого семейства.\n")
             .append("MTProto OK означает проверенный ответ на служебный запрос без входа в аккаунт.\n");
+        BackgroundPolicy.appendTo(context, header);
         ProxyTraffic traffic = ProxyStatus.traffic();
         long networkChanges = traffic.networkChanges();
         header.append("\nПрокси до сетевых проверок\n");
