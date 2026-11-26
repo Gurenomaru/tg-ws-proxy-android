@@ -37,15 +37,11 @@ final class ProxySettings {
             values.getString("cloudflare", ""), values.getString("worker", ""),
             values.getBoolean("community", false), values.getBoolean("tcp", true),
             loadSocks(), values.getBoolean("socksFirst", false), values.getBoolean("communityPlain", false),
-            values.getBoolean("communityAuto", false));
+            automaticRoutes());
     }
 
-    boolean hasAutomaticRouteChoice() {
-        return values.contains("communityAuto");
-    }
-
-    void setAutomaticRoutes(boolean enabled) {
-        values.edit().putBoolean("communityAuto", enabled).apply();
+    boolean automaticRoutes() {
+        return values.getBoolean("communityAuto", true);
     }
 
     int port() {

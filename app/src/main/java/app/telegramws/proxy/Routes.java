@@ -14,7 +14,7 @@ final class Routes {
     static String upgradedIps(String stored) {
         return LEGACY_DEFAULT_IPS.equals(stored.trim().replace("\r\n", "\n")) ? DEFAULT_IPS : stored;
     }
-    // Published in Flowseal's fallback list. These are opt-in third-party relays.
+    // Third-party relays published in Flowseal's fallback list.
     static final List<String> COMMUNITY = Arrays.asList(
         "pclead.co.uk", "offshor.co.uk", "cakeisalie.co.uk", "noskomnadzor.co.uk",
         "lovetrue.co.uk", "sorokdva.co.uk", "pyatdesyatdva.co.uk", "kartoshka.co.uk",

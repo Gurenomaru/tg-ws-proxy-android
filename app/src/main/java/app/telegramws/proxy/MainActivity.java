@@ -170,9 +170,18 @@ public final class MainActivity extends Activity {
         status.setTextColor(view.phase() == ProxyStatus.Phase.FAILED ? ERROR : online ? MINT : TEXT);
         int port = online ? view.port() : settings.port();
         address.setText(getString(R.string.loopback_address, Integer.toString(port)));
-        description.setText(view.phase() == ProxyStatus.Phase.FAILED ? view.detail()
-            : online ? "Сервис продолжит работать после выхода с этого экрана."
-            : "Запустите сервис, чтобы подключить Telegram на этом устройстве.");
+        String statusDescription;
+        if (view.phase() == ProxyStatus.Phase.FAILED) {
+            statusDescription = view.detail();
+        } else if (online) {
+            statusDescription = "Сервис продолжит работать после выхода с этого экрана.";
+        } else if (settings.automaticRoutes()) {
+            statusDescription = "Автовыбор может использовать публичные серверы Flowseal. "
+                + "Их операторы видят IP и время подключения. Автовыбор можно отключить в настройках маршрутов.";
+        } else {
+            statusDescription = "Запустите сервис, чтобы подключить Telegram на этом устройстве.";
+        }
+        description.setText(statusDescription);
         toggle.setText(online || starting ? "Остановить прокси" : "Запустить прокси");
         toggle.setEnabled(android.os.SystemClock.uptimeMillis() >= busyUntil);
         connect.setEnabled(online);
@@ -416,22 +425,9 @@ public final class MainActivity extends Activity {
         if (phase == ProxyStatus.Phase.RUNNING || phase == ProxyStatus.Phase.STARTING) {
             stopService(new Intent(this, ProxyService.class));
             updateAfterToggle();
-        } else if (settings.hasAutomaticRouteChoice()) {
-            startProxy();
         } else {
-            new AlertDialog.Builder(this).setTitle("Добавить автоматический резерв?")
-                .setMessage("На мобильной сети прокси начнёт с публичных серверов Flowseal. В других сетях "
-                    + "они будут резервом. Эти серверы видят IP и время подключения. На порту 80 "
-                    + "используется MTProto без внешнего TLS. Выбор можно изменить в настройках маршрутов.")
-                .setPositiveButton("Разрешить резерв", (dialog, which) -> startWithAutomaticRoutes(true))
-                .setNegativeButton("Оставить мои настройки", (dialog, which) -> startWithAutomaticRoutes(false))
-                .show();
+            startProxy();
         }
-    }
-
-    private void startWithAutomaticRoutes(boolean enabled) {
-        settings.setAutomaticRoutes(enabled);
-        startProxy();
     }
 
     private void startProxy() {
