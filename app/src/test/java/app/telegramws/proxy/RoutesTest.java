@@ -82,6 +82,31 @@ public final class RoutesTest {
     }
 
     @Test
+    public void wifiChecksDirectRoutesBeforeOneGroupOfBothPublicTransports() {
+        var auto = new Routes.Config(1443, "", Collections.emptyMap(),
+            "own.example.org", "", true, true, null, false, false, true);
+        var dc = Routes.Dc.fromWire((short) 2);
+        var groups = Routes.automaticGroups(dc, auto, RouteHealth.Kind.WIFI);
+        assertEquals(2, groups.size());
+        assertTrue(groups.get(0).stream().noneMatch(Routes.Stage::publicRelay));
+        assertTrue(groups.get(0).stream().flatMap(stage -> stage.targets().stream())
+            .anyMatch(target -> target.host().endsWith("own.example.org")));
+        assertTrue(groups.get(1).stream().allMatch(Routes.Stage::publicRelay));
+        assertEquals(443, groups.get(1).get(0).targets().get(0).port());
+        assertEquals(80, groups.get(1).get(1).targets().get(0).port());
+    }
+
+    @Test
+    public void automaticGroupsHonorAnExplicitFirstSocksRoute() {
+        var config = new Routes.Config(1443, "", Collections.emptyMap(),
+            "", "", false, true, Socks5.parse("127.0.0.1:1080", "", ""), true, false, true);
+        var groups = Routes.automaticGroups(Routes.Dc.fromWire((short) -2), config, RouteHealth.Kind.CELLULAR);
+        assertEquals(1, groups.get(0).size());
+        assertTrue(groups.get(0).get(0).targets().get(0).socks());
+        assertEquals(80, groups.get(1).get(0).targets().get(0).port());
+    }
+
+    @Test
     public void mobilePreferencePreservesOptInAndExplicitProxySettings() {
         var dc = Routes.Dc.fromWire((short) 2);
         Routes.Config declined = new Routes.Config(1443, "", Collections.emptyMap(),

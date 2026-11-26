@@ -69,9 +69,9 @@ final class Routes {
                   String worker, boolean community, boolean tcp, Socks5.Endpoint socks, boolean socksFirst,
                   boolean communityPlain, boolean communityAuto) {}
 
-    record Stage(List<Target> targets, int attemptLimit) {
+    record Stage(List<Target> targets, int attemptLimit, boolean publicRelay) {
         Stage(List<Target> targets) {
-            this(targets, targets.size());
+            this(targets, targets.size(), false);
         }
 
         Stage(Target target) {
@@ -146,6 +146,33 @@ final class Routes {
         return stages;
     }
 
+    static List<List<Stage>> automaticGroups(Dc dc, Config config, RouteHealth.Kind kind) {
+        List<Stage> stages = ordered(dc, config, kind, null);
+        List<List<Stage>> groups = new ArrayList<>();
+        if (stages.isEmpty()) {
+            return groups;
+        }
+        int start = 0;
+        if (config.socksFirst && stages.get(start).targets.get(0).socks) {
+            groups.add(Collections.singletonList(stages.get(start++)));
+        }
+        if (start < stages.size() && stages.get(start).publicRelay && stages.get(start).targets.get(0).port == 80) {
+            groups.add(Collections.singletonList(stages.get(start++)));
+        }
+        List<Stage> privateRoutes = new ArrayList<>();
+        List<Stage> publicRoutes = new ArrayList<>();
+        for (Stage stage : stages.subList(start, stages.size())) {
+            (stage.publicRelay ? publicRoutes : privateRoutes).add(stage);
+        }
+        if (!privateRoutes.isEmpty()) {
+            groups.add(privateRoutes);
+        }
+        if (!publicRoutes.isEmpty()) {
+            groups.add(publicRoutes);
+        }
+        return groups;
+    }
+
     static List<Stage> ordered(Dc dc, Config config, RouteHealth.Kind kind, Target preferred) {
         boolean automaticMobile = kind == RouteHealth.Kind.CELLULAR && config.communityAuto
             && config.cloudflare.isEmpty() && config.worker.isEmpty();
@@ -168,7 +195,7 @@ final class Routes {
             if (rest.isEmpty()) {
                 stages.remove(i);
             } else {
-                stages.set(i, new Stage(rest, Math.min(stage.attemptLimit, rest.size())));
+                stages.set(i, new Stage(rest, Math.min(stage.attemptLimit, rest.size()), stage.publicRelay));
             }
             stages.add(first, new Stage(preferred));
             break;
@@ -220,7 +247,7 @@ final class Routes {
         for (String domain : COMMUNITY) {
             relays.add(cloudflare(dc, domain, port));
         }
-        return new Stage(relays, COMMUNITY_ATTEMPTS);
+        return new Stage(relays, COMMUNITY_ATTEMPTS, true);
     }
 
     private static Target cloudflare(Dc dc, String domain, int port) {

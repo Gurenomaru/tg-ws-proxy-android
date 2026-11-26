@@ -20,24 +20,29 @@ final class RouteHealth {
         }
     }
 
-    private record Working(Routes.Target target, long observedAt) {}
+    private record Working(Routes.Target target, long observedAt, Object networkGeneration) {}
+    private final Object networkGeneration = new Object();
 
     final Kind kind;
     private record Key(Routes.Dc dc, Routes.Target target) {}
     private record Failure(int count, long retryAt) {}
 
-    private record StageKey(Routes.Dc dc, Routes.Stage stage) {}
+    private record GroupKey(Routes.Dc dc, List<Routes.Stage> group) {}
 
-    static final class StageScan {
-        // Accessed while holding the scan's monitor.
-        List<Routes.Target> ranked = Collections.emptyList();
-        long expiresAt = System.nanoTime();
+    record Ranking(List<Routes.Target> targets, long expiresAt) {
+        boolean fresh(long now) {
+            return now - expiresAt < 0;
+        }
     }
 
-    private final Map<StageKey, StageScan> scans = new ConcurrentHashMap<>();
+    static final class GroupScan {
+        volatile Ranking ranking = new Ranking(Collections.emptyList(), System.nanoTime());
+    }
 
-    StageScan scan(Routes.Dc dc, Routes.Stage stage) {
-        return scans.computeIfAbsent(new StageKey(dc, stage), key -> new StageScan());
+    private final Map<GroupKey, GroupScan> scans = new ConcurrentHashMap<>();
+
+    GroupScan scan(Routes.Dc dc, List<Routes.Stage> group) {
+        return scans.computeIfAbsent(new GroupKey(dc, group), key -> new GroupScan());
     }
 
     private final Map<Key, Failure> failures = new ConcurrentHashMap<>();
@@ -59,12 +64,24 @@ final class RouteHealth {
     }
 
     Routes.Target preferred(Routes.Dc dc) {
+        return preferred(dc, false);
+    }
+
+    Routes.Target preferredOnCurrentNetwork(Routes.Dc dc) {
+        return preferred(dc, true);
+    }
+
+    private Routes.Target preferred(Routes.Dc dc, boolean currentNetworkOnly) {
         Working route = working.get(dc);
         if (route == null) {
             return null;
         }
         if (System.nanoTime() - route.observedAt > TimeUnit.MINUTES.toNanos(15)) {
             working.remove(dc, route);
+            return null;
+        }
+        if (currentNetworkOnly && (route.networkGeneration != networkGeneration
+            || System.nanoTime() - route.observedAt > TimeUnit.MINUTES.toNanos(5))) {
             return null;
         }
         return route.target;
@@ -78,7 +95,7 @@ final class RouteHealth {
     void succeeded(Routes.Dc dc, Routes.Target target) {
         working.compute(dc, (key, previous) -> {
             failures.remove(new Key(dc, target));
-            return new Working(target, System.nanoTime());
+            return new Working(target, System.nanoTime(), networkGeneration);
         });
     }
 

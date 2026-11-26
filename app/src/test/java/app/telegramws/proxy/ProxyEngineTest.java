@@ -51,7 +51,10 @@ public final class ProxyEngineTest {
         assertNull(mobile.preferred(dc));
         mobile.succeeded(dc, relay);
         assertEquals(direct, history.select(RouteHealth.Kind.WIFI).preferred(dc));
-        assertEquals(relay, history.select(RouteHealth.Kind.CELLULAR).preferred(dc));
+        assertEquals(relay, mobile.preferredOnCurrentNetwork(dc));
+        var returning = history.select(RouteHealth.Kind.CELLULAR);
+        assertEquals(relay, returning.preferred(dc));
+        assertNull(returning.preferredOnCurrentNetwork(dc));
         history.select(RouteHealth.Kind.CELLULAR).failed(dc, relay, System.nanoTime(), true);
         assertNull(history.select(RouteHealth.Kind.CELLULAR).preferred(dc));
         assertEquals(direct, history.select(RouteHealth.Kind.WIFI).preferred(dc));

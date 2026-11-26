@@ -45,8 +45,12 @@ final class ProxyEngine implements Closeable {
     private static final int CONNECT_TIMEOUT = 3500;
     private static final long ROUTE_HEAD_START = TimeUnit.MILLISECONDS.toNanos(220);
     private static final long VERIFIED_HEAD_START = TimeUnit.MILLISECONDS.toNanos(900);
-    private static final long SCAN_BUDGET = TimeUnit.MILLISECONDS.toNanos(2500);
-    private static final long SELECTION_SCAN_BUDGET = TimeUnit.SECONDS.toNanos(5);
+    private static final long PUBLIC_SCAN_BUDGET = TimeUnit.MILLISECONDS.toNanos(2500);
+    private static final long DIRECT_SCAN_BUDGET = TimeUnit.MILLISECONDS.toNanos(1600);
+    private static final long COMPARISON_WINDOW = TimeUnit.MILLISECONDS.toNanos(180);
+    private static final long LIVE_ROUTE_BUDGET = TimeUnit.MILLISECONDS.toNanos(1000);
+    private static final long AUTO_DIAL_BUDGET = TimeUnit.MILLISECONDS.toNanos(1600);
+    private static final long AUTO_SELECTION_BUDGET = TimeUnit.MILLISECONDS.toNanos(6500);
     private static final long SCAN_TTL = TimeUnit.MINUTES.toNanos(5);
     private static final long FAILED_SCAN_TTL = TimeUnit.SECONDS.toNanos(30);
     private static final int FIRST_REPLY_TIMEOUT = 6000;
@@ -60,6 +64,8 @@ final class ProxyEngine implements Closeable {
     private final ExecutorService reverse = Executors.newFixedThreadPool(CLIENT_LIMIT);
     private final ExecutorService dialing = new ThreadPoolExecutor(24, 24, 0, TimeUnit.SECONDS,
         new ArrayBlockingQueue<>(96));
+    private final ThreadPoolExecutor measurements = new ThreadPoolExecutor(24, 24, 20, TimeUnit.SECONDS,
+        new ArrayBlockingQueue<>(64));
     private final ScheduledThreadPoolExecutor deadlines = new ScheduledThreadPoolExecutor(1);
     private final Object networkLock = new Object();
     private final Set<Session> sessions = ConcurrentHashMap.newKeySet();
@@ -81,6 +87,7 @@ final class ProxyEngine implements Closeable {
         this.secret = secret;
         this.log = log;
         deadlines.setRemoveOnCancelPolicy(true);
+        measurements.allowCoreThreadTimeOut(true);
         listener = new ServerSocket();
         try {
             listener.bind(new InetSocketAddress("127.0.0.1", config.port()), 32);
@@ -267,21 +274,7 @@ final class ProxyEngine implements Closeable {
 
     private Connected selectRoute(Session session, Routes.Dc dc) throws InterruptedException {
         if (config.communityAuto()) {
-            long scanDeadline = System.nanoTime() + SELECTION_SCAN_BUDGET;
-            for (Routes.Stage stage : Routes.ordered(dc, config, session.routes.kind, null)) {
-                if (session.isClosed()) {
-                    return null;
-                }
-                for (Routes.Target target : measuredRoutes(session, dc, stage, scanDeadline)) {
-                    if (!session.routes.ready(dc, target, System.nanoTime())) {
-                        continue;
-                    }
-                    Connected picked = race(session, dc, Collections.singletonList(target));
-                    if (picked != null) {
-                        return picked;
-                    }
-                }
-            }
+            return selectAutomaticRoute(session, dc);
         }
 
         // Some servers can forward Telegram traffic even when the synthetic request gets no reply.
@@ -304,7 +297,7 @@ final class ProxyEngine implements Closeable {
                 continue;
             }
             Connected picked = race(session, dc, choices.subList(0, Math.min(limit, choices.size())));
-            if (picked == null && !config.communityAuto() && !session.isClosed()) {
+            if (picked == null && !session.isClosed()) {
                 long retryAt = System.nanoTime();
                 for (Routes.Target target : choices) {
                     if (target.sni() != null && session.routes.ready(dc, target, retryAt)) {
@@ -320,41 +313,119 @@ final class ProxyEngine implements Closeable {
         return null;
     }
 
-    private List<Routes.Target> measuredRoutes(Session session, Routes.Dc dc, Routes.Stage stage, long scanDeadline)
+    private Connected selectAutomaticRoute(Session session, Routes.Dc dc) throws InterruptedException {
+        List<List<Routes.Stage>> groups = Routes.automaticGroups(dc, config, session.routes.kind);
+        long now = System.nanoTime();
+        long deadline = now + AUTO_SELECTION_BUDGET;
+        Routes.Target live = session.routes.preferredOnCurrentNetwork(dc);
+        if (live != null && session.routes.ready(dc, live, now)) {
+            Connected picked = race(session, dc, Collections.singletonList(live), now + LIVE_ROUTE_BUDGET);
+            if (picked != null) {
+                return picked;
+            }
+        }
+
+        for (List<Routes.Stage> group : groups) {
+            RouteHealth.Ranking cached = session.routes.scan(dc, group).ranking;
+            if (cached.fresh(System.nanoTime())) {
+                Connected picked = connectRanked(session, dc, cached.targets(), deadline);
+                if (picked != null) {
+                    return picked;
+                }
+            }
+        }
+        for (List<Routes.Stage> group : groups) {
+            List<Routes.Target> ranked = measuredRoutes(session, dc, group, deadline);
+            Connected picked = connectRanked(session, dc, ranked, deadline);
+            if (picked != null) {
+                return picked;
+            }
+        }
+
+        // Some servers can forward Telegram traffic even when an unauthenticated probe fails.
+        for (List<Routes.Stage> group : groups) {
+            if (session.isClosed() || System.nanoTime() - deadline >= 0) {
+                return null;
+            }
+            Routes.Target previous = session.routes.preferred(dc);
+            List<Routes.Target> choices = sampleRoutes(session, dc, group, previous);
+            if (!choices.isEmpty()) {
+                long attemptDeadline = Math.min(deadline, System.nanoTime() + AUTO_DIAL_BUDGET);
+                Connected picked = race(session, dc, choices, attemptDeadline);
+                if (picked != null) {
+                    return picked;
+                }
+            }
+        }
+        return null;
+    }
+
+    private Connected connectRanked(Session session, Routes.Dc dc, List<Routes.Target> ranked, long deadline)
         throws InterruptedException {
-        RouteHealth.StageScan scan = session.routes.scan(dc, stage);
+        long now = System.nanoTime();
+        if (ranked.isEmpty() || session.isClosed() || now - deadline >= 0) {
+            return null;
+        }
+        List<Routes.Target> available = new ArrayList<>(ranked);
+        available.removeIf(target -> !session.routes.ready(dc, target, now));
+        if (available.isEmpty()) {
+            return null;
+        }
+        long attemptDeadline = Math.min(deadline, now + AUTO_DIAL_BUDGET);
+        return race(session, dc, available, attemptDeadline, ROUTE_HEAD_START);
+    }
+
+    private List<Routes.Target> measuredRoutes(Session session, Routes.Dc dc, List<Routes.Stage> group, long deadline)
+        throws InterruptedException {
+        RouteHealth.GroupScan scan = session.routes.scan(dc, group);
         synchronized (scan) {
             long now = System.nanoTime();
-            if (session.isClosed() || now - scan.expiresAt < 0) {
-                return scan.ranked;
+            RouteHealth.Ranking cached = scan.ranking;
+            if (session.isClosed() || now - deadline >= 0) {
+                return Collections.emptyList();
             }
-            List<Routes.Target> candidates = new ArrayList<>(stage.targets());
-            candidates.removeIf(target -> !session.routes.ready(dc, target, now));
-            int limit = stage.attemptLimit();
-            if (now - scanDeadline >= 0) {
-                return scan.ranked;
+            if (cached.fresh(now) && (cached.targets().isEmpty()
+                || cached.targets().stream().anyMatch(target -> session.routes.ready(dc, target, now)))) {
+                return cached.targets();
             }
-            if (candidates.size() > limit) {
-                Collections.rotate(candidates, -Math.floorMod(rotation.getAndAdd(limit), candidates.size()));
-                if (!scan.ranked.isEmpty() && candidates.remove(scan.ranked.get(0))) {
-                    candidates.add(0, scan.ranked.get(0));
-                }
-                candidates = candidates.subList(0, limit);
-            }
-
-            long budget = Math.min(SCAN_BUDGET, scanDeadline - now);
-            List<Routes.Target> ranked = rankRoutes(dc, candidates, session, now + budget);
-            if (!session.isClosed() && (!ranked.isEmpty() || budget == SCAN_BUDGET)) {
-                scan.ranked = ranked;
-                scan.expiresAt = System.nanoTime() + (ranked.isEmpty() ? FAILED_SCAN_TTL : SCAN_TTL);
+            Routes.Target previous = cached.targets().isEmpty() ? session.routes.preferred(dc) : cached.targets().get(0);
+            List<Routes.Target> choices = sampleRoutes(session, dc, group, previous);
+            long budget = group.get(0).publicRelay() ? PUBLIC_SCAN_BUDGET : DIRECT_SCAN_BUDGET;
+            long scanDeadline = Math.min(deadline, now + budget);
+            List<Routes.Target> ranked = rankRoutes(dc, choices, session, scanDeadline);
+            if (!session.isClosed() && (!ranked.isEmpty() || deadline - now >= budget)) {
+                scan.ranking = new RouteHealth.Ranking(ranked,
+                    System.nanoTime() + (ranked.isEmpty() ? FAILED_SCAN_TTL : SCAN_TTL));
             }
             return ranked;
         }
     }
 
+    private List<Routes.Target> sampleRoutes(Session session, Routes.Dc dc, List<Routes.Stage> group,
+                                              Routes.Target previous) {
+        List<Routes.Target> choices = new ArrayList<>();
+        long now = System.nanoTime();
+        for (Routes.Stage stage : group) {
+            List<Routes.Target> available = new ArrayList<>(stage.targets());
+            available.removeIf(target -> !session.routes.ready(dc, target, now));
+            int limit = stage.attemptLimit();
+            if (available.size() > limit) {
+                Collections.rotate(available, -Math.floorMod(rotation.getAndAdd(limit), available.size()));
+            }
+            if (available.remove(previous)) {
+                available.add(0, previous);
+            }
+            choices.addAll(available.subList(0, Math.min(limit, available.size())));
+        }
+        if (choices.remove(previous)) {
+            choices.add(0, previous);
+        }
+        return choices;
+    }
+
     private List<Routes.Target> rankRoutes(Routes.Dc dc, List<Routes.Target> candidates, Session session, long deadline)
         throws InterruptedException {
-        ExecutorCompletionService<RouteTiming> results = new ExecutorCompletionService<>(dialing);
+        ExecutorCompletionService<RouteTiming> results = new ExecutorCompletionService<>(measurements);
         List<Future<RouteTiming>> pending = new ArrayList<>();
         List<Socket> sockets = new ArrayList<>();
         List<RouteTiming> timings = new ArrayList<>();
@@ -370,7 +441,7 @@ final class ProxyEngine implements Closeable {
                     pending.add(results.submit(() -> {
                         long started = System.nanoTime();
                         Connected connected = dial(target, socket);
-                        socket.setSoTimeout((int) TimeUnit.NANOSECONDS.toMillis(SCAN_BUDGET));
+                        socket.setSoTimeout((int) TimeUnit.NANOSECONDS.toMillis(PUBLIC_SCAN_BUDGET));
                         if (connected.webSocket == null) {
                             ProxyProbe.verifyRaw(socket, dc.relayId());
                         } else {
@@ -383,14 +454,18 @@ final class ProxyEngine implements Closeable {
                 }
             }
 
+            long comparisonDeadline = deadline;
             for (int i = 0; i < pending.size() && !session.isClosed(); i++) {
-                long remaining = Math.max(0, deadline - System.nanoTime());
+                long remaining = Math.max(0, comparisonDeadline - System.nanoTime());
                 Future<RouteTiming> result = results.poll(remaining, TimeUnit.NANOSECONDS);
                 if (result == null) {
                     break;
                 }
                 try {
                     timings.add(result.get());
+                    if (timings.size() == 1) {
+                        comparisonDeadline = Math.min(deadline, System.nanoTime() + COMPARISON_WINDOW);
+                    }
                 } catch (ExecutionException ignored) {
                     // Only routes with a verified MTProto reply qualify for the ranking.
                 }
@@ -420,15 +495,24 @@ final class ProxyEngine implements Closeable {
 
     private Connected race(Session session, Routes.Dc dc, List<Routes.Target> targets)
         throws InterruptedException {
+        return race(session, dc, targets, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT + 550));
+    }
+
+    private Connected race(Session session, Routes.Dc dc, List<Routes.Target> targets, long deadline)
+        throws InterruptedException {
+        long headStart = config.communityAuto() && targets.get(0).equals(session.routes.preferred(dc))
+            ? VERIFIED_HEAD_START : ROUTE_HEAD_START;
+        return race(session, dc, targets, deadline, headStart);
+    }
+
+    private Connected race(Session session, Routes.Dc dc, List<Routes.Target> targets, long deadline, long headStart)
+        throws InterruptedException {
         ExecutorCompletionService<Connected> results = new ExecutorCompletionService<>(dialing);
         Map<Future<Connected>, PendingAttempt> attempts = new HashMap<>();
         List<Socket> sockets = new ArrayList<>();
         Connected winner = null;
         List<String> errors = new ArrayList<>();
-        long headStart = config.communityAuto() && targets.get(0).equals(session.routes.preferred(dc))
-            ? VERIFIED_HEAD_START : ROUTE_HEAD_START;
         long nextLaunch = System.nanoTime();
-        long deadline = nextLaunch + TimeUnit.MILLISECONDS.toNanos(CONNECT_TIMEOUT + 550);
         int launched = 0;
         int completed = 0;
         try {
@@ -436,6 +520,14 @@ final class ProxyEngine implements Closeable {
                 long now = System.nanoTime();
                 if (now - deadline >= 0) {
                     errors.add("тайм-аут");
+                    if (config.communityAuto()) {
+                        for (var entry : attempts.entrySet()) {
+                            if (!entry.getKey().isDone()) {
+                                PendingAttempt attempt = entry.getValue();
+                                session.routes.failed(dc, attempt.target, attempt.started, now, true);
+                            }
+                        }
+                    }
                     break;
                 }
                 boolean hasAlternatives = launched < targets.size();
@@ -578,6 +670,7 @@ final class ProxyEngine implements Closeable {
         clients.shutdownNow();
         reverse.shutdownNow();
         dialing.shutdownNow();
+        measurements.shutdownNow();
         deadlines.shutdownNow();
     }
 
