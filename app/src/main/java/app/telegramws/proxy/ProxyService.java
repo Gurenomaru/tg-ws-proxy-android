@@ -33,7 +33,7 @@ public final class ProxyService extends Service {
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private final Object lock = new Object();
-    private ProxyEngine engine;
+    private ProxyRuntime engine;
     private volatile boolean destroyed;
     private boolean started;
     private boolean watchingNetwork;
@@ -116,7 +116,9 @@ public final class ProxyService extends Service {
             return START_STICKY;
         }
         started = true;
-        Routes.Config config = new ProxySettings(this).load();
+        ProxySettings settings = new ProxySettings(this);
+        Routes.Config config = settings.load();
+        boolean rust = settings.rustEnabled();
         ProxyStatus.phase(ProxyStatus.Phase.STARTING, 0, "");
         boolean restored = intent == null;
         ProxyStatus.traffic().setRestored(restored);
@@ -136,12 +138,30 @@ public final class ProxyService extends Service {
         connectivity.registerDefaultNetworkCallback(networkCallback, main);
         watchingNetwork = true;
         ProxyTraffic traffic = ProxyStatus.traffic();
-        executor.execute(() -> run(config, traffic));
+        executor.execute(() -> run(config, traffic, rust));
         return START_STICKY;
     }
 
-    private void run(Routes.Config config, ProxyTraffic traffic) {
-        try (ProxyEngine created = new ProxyEngine(config, ProxySettings.key(config.secret()), ProxyStatus::log, traffic)) {
+    private ProxyRuntime createEngine(Routes.Config config, ProxyTraffic traffic, boolean rust) throws IOException {
+        byte[] key = ProxySettings.key(config.secret());
+        if (rust) {
+            try {
+                var engine = new RustProxyEngine(config, key, traffic);
+                traffic.setEngine("Rust");
+                return engine;
+            } catch (LinkageError unavailable) {
+                ProxyStatus.log("Движок Rust недоступен · запущен Java");
+            } catch (BindException addressInUse) {
+                throw addressInUse;
+            } catch (IOException failure) {
+                ProxyStatus.log("Движок Rust не запустился · запущен Java");
+            }
+        }
+        return new ProxyEngine(config, key, ProxyStatus::log, traffic);
+    }
+
+    private void run(Routes.Config config, ProxyTraffic traffic, boolean rust) {
+        try (ProxyRuntime created = createEngine(config, traffic, rust)) {
             synchronized (lock) {
                 if (destroyed) {
                     return;

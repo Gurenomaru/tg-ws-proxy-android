@@ -2,17 +2,28 @@ plugins {
     id 'com.android.application'
 }
 
+def rustLibraries = layout.buildDirectory.dir('generated/rust/jniLibs')
+def licenseAssets = layout.buildDirectory.dir('generated/rust/assets')
+def rustTarget = layout.buildDirectory.dir('rust-target')
+def nativeProject = rootProject.file('native')
+def nativeBuildScript = rootProject.file('scripts/build_native.py')
+def nativeApi = 26
+
 android {
     namespace 'app.telegramws.proxy'
     compileSdk 35
+    ndkVersion '27.2.12479018'
 
     defaultConfig {
         applicationId 'app.telegramws.proxy'
-        minSdk 26
+        minSdk nativeApi
         targetSdk 35
-        versionCode 13
-        versionName '0.2.11'
+        versionCode 14
+        versionName '0.3.1'
     }
+
+    sourceSets.main.jniLibs.srcDir(rustLibraries)
+    sourceSets.main.assets.srcDir(licenseAssets)
 
     buildFeatures {
         buildConfig true
@@ -22,6 +33,25 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
+
+def buildRust = tasks.register('buildRust', Exec) {
+    inputs.files(new File(nativeProject, 'Cargo.toml'), new File(nativeProject, 'Cargo.lock'),
+        fileTree(new File(nativeProject, 'src')), nativeBuildScript, rootProject.file('LICENSE'),
+        rootProject.file('LICENSE-Flowseal'))
+    inputs.property('ndkVersion', android.ndkVersion)
+    inputs.property('androidApi', nativeApi)
+    outputs.dirs(rustLibraries, licenseAssets)
+    doFirst {
+        commandLine providers.environmentVariable('TGWS_PYTHON').getOrElse('python'),
+            nativeBuildScript, '--ndk', androidComponents.sdkComponents.sdkDirectory.get().dir("ndk/${android.ndkVersion}").asFile,
+            '--native', nativeProject, '--output', rustLibraries.get().asFile,
+            '--licenses', licenseAssets.get().dir('licenses').asFile,
+            '--target-dir', rustTarget.get().asFile, '--api', nativeApi.toString()
+    }
+}
+tasks.named('preBuild').configure {
+    dependsOn(buildRust)
 }
 
 dependencies {

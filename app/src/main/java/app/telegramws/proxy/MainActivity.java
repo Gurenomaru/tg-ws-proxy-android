@@ -558,6 +558,8 @@ public final class MainActivity extends Activity {
         EditText socksPassword = field(form, "Пароль SOCKS5", socks == null ? "" : socks.password(),
             InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
         CheckBox socksFirst = check(form, "Пробовать SOCKS5 первым", current.socksFirst());
+        CheckBox rust = check(form, "Экспериментальный движок Rust", settings.rustEnabled());
+        add(form, text("Выбор применяется при следующем запуске прокси.", 13, MUTED), 10);
         TextView error = text("", 14, ERROR);
         add(form, error, 3);
         AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Настройки маршрутов").setView(scroll)
@@ -572,6 +574,7 @@ public final class MainActivity extends Activity {
                     socksAddress.getText().toString(), socksUser.getText().toString(),
                     socksPassword.getText().toString(), socksFirst.isChecked(), communityPlain.isChecked(),
                     communityAuto.isChecked());
+                settings.setRustEnabled(rust.isChecked());
                 dialog.dismiss();
                 render();
             } catch (IllegalArgumentException e) {

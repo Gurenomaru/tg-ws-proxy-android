@@ -40,7 +40,7 @@ import java.util.function.Consumer;
 import java.util.function.LongConsumer;
 import javax.net.ssl.SSLException;
 
-final class ProxyEngine implements Closeable {
+final class ProxyEngine implements ProxyRuntime {
     private static final int CLIENT_LIMIT = 24;
     private static final int CONNECT_TIMEOUT = 3500;
     private static final long ROUTE_HEAD_START = TimeUnit.MILLISECONDS.toNanos(220);
@@ -97,11 +97,11 @@ final class ProxyEngine implements Closeable {
         }
     }
 
-    int port() {
+    @Override public int port() {
         return listener.getLocalPort();
     }
 
-    void serve() throws IOException {
+    @Override public void serve() throws IOException {
         while (!stopped) {
             Socket socket = listener.accept();
             boolean probe = ProxyProbe.isLocalProbe(socket.getPort());
@@ -640,7 +640,7 @@ final class ProxyEngine implements Closeable {
         networkChanged(RouteHealth.Kind.OTHER);
     }
 
-    void networkChanged(RouteHealth.Kind kind) {
+    @Override public void networkChanged(RouteHealth.Kind kind) {
         List<Session> stale;
         synchronized (networkLock) {
             routes = config.communityAuto() ? routeHistory.select(kind) : new RouteHealth();
